@@ -29,11 +29,15 @@ pie** con la cámara libre, mientras sigues modelando.
   PCF 3×3 sobre un mapa de sombras empaquetado de 2048×2048.
 - **Cielo fotográfico** con degradado y halo solar (no el fondo gris del CAD),
   **tone mapping ACES** y corrección gamma.
+- **Césped 3D**: las superficies cuya textura o material se llame
+  «césped»/«grass» (también pasto, hierba, lawn, turf, grama, sod…) reciben
+  miles de hojas sembradas sobre la propia cara —con el verde medio de tu
+  textura— que **se mecen con el viento** y reciben las sombras del sol.
 - **Cámara libre tipo juego** (ratón + WASD) y **reencuadre automático** al
   abrir la ventana.
 - **Auto-actualización**: si cambias el modelo, la ventana lo reconstruye sola.
-- **Ajustes persistentes**: sombras, exposición y ambiente se recuerdan entre
-  sesiones.
+- **Ajustes persistentes**: sombras, exposición, ambiente, césped, viento y
+  densidad de césped se recuerdan entre sesiones.
 
 ---
 
@@ -86,10 +90,14 @@ Puedes abrir la ventana de dos formas:
 | Rueda del ratón    | Acercar / alejar                         |
 | `R`                | Reencuadrar todo el modelo               |
 | `T`                | Activar / desactivar sombras             |
+| `C`                | Activar / desactivar el césped 3D        |
+| `V`                | Activar / desactivar el viento           |
 | `Esc`              | Cerrar la ventana                        |
 
 En la barra superior de la ventana tienes botones para **Actualizar**,
-**Reencuadrar**, alternar **Sombras** y ajustar **Exposición** y **Ambiente**.
+**Reencuadrar**, alternar **Sombras**, **Césped 3D** y **Viento**, y ajustar
+**Exposición**, **Ambiente** y la **densidad de césped** (hojas por m²; 0 lo
+desactiva).
 
 ---
 
@@ -110,8 +118,17 @@ ViReal no refleja el viewport: construye su propia escena leyendo el modelo.
 4. **Luz y sombras**: se construye una matriz ortográfica de luz a partir de la
    dirección del sol; se renderiza un mapa de profundidad de 2048² y en el pase
    principal se compara con PCF 3×3 (con sesgo por pendiente y corrección del
-   plano receptor para evitar acné).
-5. **Presentación**: cielo con degradado y disco solar, *tone mapping* ACES,
+   plano receptor para evitar acné). El mapa se cachea y sólo se rehace cuando
+   cambia la escena (no depende de la cámara).
+5. **Césped 3D**: las caras detectadas como césped se triangulan y sobre ellas
+   se siembra un número de hojas proporcional a su área (hasta un tope). Cada
+   hoja es una cinta afilada de 3 triángulos, con altura, ancho, inclinación,
+   tono y color propios (teñidos con el color medio real de la textura). Un
+   programa aparte las dibuja y las deforma en el *vertex shader* con tres senos
+   desfasados (ráfagas de viento) ponderados por la altura; reciben las sombras
+   del sol. La siembra es determinista, así que el césped no «salta» al
+   reconstruir por cambios ajenos.
+6. **Presentación**: cielo con degradado y disco solar, *tone mapping* ACES,
    gamma 2.2 y un HUD dibujado con `QPainter` sobre el widget.
 
 ---
@@ -133,10 +150,10 @@ ingetrazo_vireal/
 ## Empaquetado para publicar
 
 ```powershell
-./build_zip.ps1 -Version 0.1.0
+./build_zip.ps1 -Version 0.2.0
 ```
 
-Genera `dist/ingetrazo_vireal-0.1.0.zip` con `vireal.py`, `README.md`,
+Genera `dist/ingetrazo_vireal-0.2.0.zip` con `vireal.py`, `README.md`,
 `LICENSE` y `CHANGELOG.md`. El usuario final sólo necesita copiar `vireal.py`
 a su carpeta de plugins. Recuerda subir también `dist/` a la *release* de
 GitHub (o adjuntar el `.zip`).
@@ -150,8 +167,13 @@ GitHub (o adjuntar el `.zip`).
   transmisión, pero no relieve. Es el máximo que permite el modelo de datos.
 - Sin **reflejos de entorno reales**, **SSAO** ni **anti-aliasing** más allá
   del MSAA del *surface*.
-- Ideas para próximas versiones: reflejos por entorno, *bloom* suave,
-  césped/terreno, sombras suaves (PCSS) y una paleta de cielos elegible.
+- El **césped 3D** es geométrico (hojas sueltas, no *tufts* con textura
+  alfa), no se auto-sombra entre hojas y se siembra al reconstruir la escena:
+  en céspedes muy grandes, más densidad = más hojas = más trabajo por
+  reconstrucción. La densidad es ajustable desde la barra.
+- Ideas para próximas versiones: reflejos por entorno, *bloom* suave, suelo y
+  césped de terreno continuo, más hojas *instanced* (GPU) para densidades muy
+  altas, sombras suaves (PCSS) y una paleta de cielos elegible.
 
 ---
 

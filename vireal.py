@@ -19,6 +19,10 @@ Es una extensión de sólo ``setup(app)`` (API v2): añade una entrada en
 Extensiones (Ctrl+Alt+M), un panel «ViReal» con el botón de abrir y la ventana
 en sí. La ventana se refresca sola: si cambias el modelo, la reconstruye.
 
+Las superficies cuya textura o material se llame «césped»/«grass» (pasto,
+hierba, lawn, turf…) reciben **césped 3D**: miles de hojas sembradas sobre la
+cara que se mecen con el viento y reciben las sombras del sol.
+
 Instalar: copiar este archivo en la carpeta de plugins
 (Extensiones ▸ Abrir carpeta de plugins) y reiniciar IngeTrazo.
 """
@@ -26,7 +30,10 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+import random
 from array import array
+from bisect import bisect_left
 
 from PySide6.QtCore import QElapsedTimer, QPoint, QSettings, Qt, QTimer
 from PySide6.QtGui import (
@@ -36,6 +43,7 @@ from PySide6.QtGui import (
     QOpenGLFunctions,
     QPainter,
     QSurfaceFormat,
+    QVector2D,
     QVector3D,
 )
 from PySide6.QtOpenGL import (
@@ -63,7 +71,7 @@ from PySide6.QtWidgets import (
 log = logging.getLogger("ingetrazo.plugins.vireal")
 
 #: Versión de la extensión (coincide con el CHANGELOG y el paquete .zip).
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 _SETTINGS = "vireal/"
 
@@ -116,6 +124,12 @@ _SKY_UNIFORMS = (
     "u_exposure",
 )
 _DEPTH_UNIFORMS = ("u_light_vp",)
+_GRASS_UNIFORMS = (
+    "u_mvp", "u_cam", "u_sun_dir", "u_sun_col", "u_sky_col", "u_gnd_col",
+    "u_ambient", "u_exposure", "u_shadow_enable", "u_shadow",
+    "u_light_vp", "u_shadow_strength", "u_time", "u_wind_dir",
+    "u_wind_strength",
+)
 
 #: Tamaño del mapa de sombras (px).
 SHADOW_SIZE = 2048
@@ -128,6 +142,36 @@ V_NRM = 12
 V_UV = 24
 V_COL = 32
 V_PBR = 44
+
+#: Vértice del césped (otro programa): pos(3) @0, nrm(3) @12, col(3) @24,
+#: datos(4) @36 (t 0..1, fase, flexibilidad, altura) → 52 bytes.
+G_STRIDE = 52
+G_POS = 0
+G_NRM = 12
+G_COL = 24
+G_DATA = 36
+
+#: Palabras que marcan una textura o material de césped (se buscan sin
+#: acentos, sin extensión y en el nombre del archivo + su carpeta padre).
+_GRASS_WORDS = ("grass", "cesped", "pasto", "hierba", "lawn", "turf",
+                "grama", "tepe", "sod", "chacra")
+
+#: Color de la hoja cuando no se puede leer la textura del suelo.
+_GRASS_FALLBACK = (0.30, 0.45, 0.17)
+
+#: Altura (m) y ancho (m) base de cada hoja de césped.
+GRASS_HEIGHT = 0.11
+GRASS_WIDTH = 0.014
+
+#: Tope de hojas por reconstrucción (una escena enorme no debe colgar la app).
+GRASS_MAX_BLADES = 20000
+
+#: Velocidad/amplitud del viento por defecto.
+WIND_DIR = (0.80, 0.60)
+WIND_STRENGTH = 0.05
+
+#: Caché del color medio de las texturas (para teñir las hojas).
+_AVG_COLOR_CACHE: dict = {}
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +395,125 @@ void main() {
 }
 """
 
+_GRASS_VERT = """
+#version 330 core
+layout(location = 0) in vec3 a_pos;   // posición en reposo (mundo)
+layout(location = 1) in vec3 a_nrm;
+layout(location = 2) in vec3 a_col;
+layout(location = 3) in vec4 a_data;  // t (0..1), fase, flexibilidad, altura
+uniform mat4 u_mvp;
+uniform float u_time;
+uniform vec2 u_wind_dir;
+uniform float u_wind_strength;
+out vec3 v_world;
+out vec3 v_nrm;
+out vec3 v_col;
+out float v_t;
+void main() {
+    float t = a_data.x;
+    float phase = a_data.y;
+    float flex = a_data.z;
+    // Peso cuadrático: la base no se mueve y la punta sí. Tres senos
+    // desfasados dan ráfagas (no un vaivén uniforme).
+    float w = t * t;
+    float s = sin(u_time * 1.9 + phase) * 0.6
+            + sin(u_time * 3.7 + phase * 1.7) * 0.3
+            + sin(u_time * 0.9 + phase * 0.5) * 0.5;
+    float gust = 0.55 + 0.45 * s;
+    vec3 dir = normalize(vec3(u_wind_dir, 0.18));
+    float amp = u_wind_strength * flex * w * gust;
+    // vibración rápida en la punta (detalle)
+    amp += u_wind_strength * 0.12 * w * sin(u_time * 6.5 + phase * 3.1);
+    vec3 wp = a_pos + dir * amp;
+    v_world = wp;
+    v_nrm = a_nrm;
+    v_col = a_col;
+    v_t = t;
+    gl_Position = u_mvp * vec4(wp, 1.0);
+}
+"""
+
+_GRASS_FRAG = """
+#version 330 core
+in vec3 v_world;
+in vec3 v_nrm;
+in vec3 v_col;
+in float v_t;
+uniform vec3 u_cam;
+uniform vec3 u_sun_dir;
+uniform vec3 u_sun_col;
+uniform vec3 u_sky_col;
+uniform vec3 u_gnd_col;
+uniform float u_ambient;
+uniform float u_exposure;
+uniform int u_shadow_enable;
+uniform sampler2D u_shadow;
+uniform mat4 u_light_vp;
+uniform float u_shadow_strength;
+out vec4 fragColor;
+
+float unpackDepth(vec3 e) {
+    return dot(e, vec3(1.0, 1.0 / 255.0, 1.0 / 65025.0));
+}
+
+float grassShadow(vec3 wpos) {
+    if (u_shadow_enable == 0) return 1.0;
+    vec4 lp = u_light_vp * vec4(wpos, 1.0);
+    vec3 uvz = lp.xyz / lp.w * 0.5 + 0.5;
+    if (uvz.x <= 0.0 || uvz.x >= 1.0 || uvz.y <= 0.0 || uvz.y >= 1.0
+            || uvz.z >= 1.0) {
+        return 1.0;
+    }
+    vec2 texel = 1.0 / vec2(textureSize(u_shadow, 0));
+    vec3 ddx = dFdx(uvz);
+    vec3 ddy = dFdy(uvz);
+    float det = ddx.x * ddy.y - ddx.y * ddy.x;
+    vec2 grad = (abs(det) > 1e-12)
+        ? vec2(ddy.y * ddx.z - ddx.y * ddy.z,
+               ddx.x * ddy.z - ddy.x * ddx.z) / det
+        : vec2(0.0);
+    float glen = length(grad);
+    if (glen > 8.0) { grad *= 8.0 / glen; glen = 8.0; }
+    float bias = 0.0006 + glen * texel.x * 1.5;
+    float lit = 0.0;
+    for (int dx = -1; dx <= 1; dx++) {
+        for (int dy = -1; dy <= 1; dy++) {
+            vec2 off = vec2(dx, dy) * texel;
+            float d = unpackDepth(texture(u_shadow, uvz.xy + off).rgb);
+            lit += (uvz.z + dot(grad, off) - bias <= d) ? 1.0 : 0.0;
+        }
+    }
+    return mix(1.0, lit / 9.0, u_shadow_strength);
+}
+
+vec3 aces(vec3 x) {
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+void main() {
+    vec3 albedo = v_col;
+    vec3 N = normalize(v_nrm);
+    vec3 V = normalize(u_cam - v_world);
+    if (dot(N, V) < 0.0) N = -N;         // sombreado a dos caras
+    vec3 L = normalize(u_sun_dir);
+    float ndl = max(dot(N, L), 0.0);
+    float sh = grassShadow(v_world);
+
+    vec3 direct = albedo * u_sun_col * ndl * sh / 3.141593 * 1.25;
+    float hemi = N.z * 0.5 + 0.5;
+    vec3 amb = albedo * mix(u_gnd_col, u_sky_col, hemi) * u_ambient;
+    vec3 col = direct + amb;
+    // Translucencia aproximada: las puntas dejan pasar algo de sol.
+    col += albedo * u_sun_col * 0.07 * v_t * sh;
+
+    col *= u_exposure;
+    col = aces(col);
+    col = pow(col, vec3(1.0 / 2.2));
+    fragColor = vec4(col, 1.0);
+}
+"""
+
 
 # ---------------------------------------------------------------------------
 # Extracción de geometría del documento
@@ -384,10 +547,218 @@ class WorldGeometry:
         self.bounds = None          # (lo, hi) QVector3D
         self.faces = 0
         self.tris = 0
+        #: Caras marcadas como césped: (lista de triángulos en mundo, ruta de
+        #: textura, color de cara). Se usan para sembrar las hojas 3D.
+        self.grass_faces: list = []
 
     @property
     def empty(self) -> bool:
         return not self.runs
+
+
+def _norm_words(text: str) -> str:
+    """Minúsculas y sin acentos, para comparar con las palabras clave."""
+    text = str(text).lower()
+    for a, b in (("á", "a"), ("é", "e"), ("í", "i"), ("ó", "o"),
+                 ("ú", "u"), ("ü", "u"), ("ñ", "n"), ("à", "a"),
+                 ("è", "e"), ("ì", "i"), ("ò", "o"), ("ù", "u")):
+        text = text.replace(a, b)
+    return text
+
+
+def _is_grass(path=None, matname=None) -> bool:
+    """¿La textura (por nombre de archivo y carpeta) o el material es césped?"""
+    hay = ""
+    if path:
+        hay += " " + _norm_words(str(path).replace("\\", "/"))
+    if matname:
+        hay += " " + _norm_words(matname)
+    return any(w in hay for w in _GRASS_WORDS)
+
+
+def _average_color(path):
+    """Color medio (0..1) de una textura, para teñir las hojas. Cacheado."""
+    if path in _AVG_COLOR_CACHE:
+        return _AVG_COLOR_CACHE[path]
+    col = None
+    try:
+        from PySide6.QtGui import QImage
+        img = QImage(path)
+        if not img.isNull():
+            img = img.scaled(24, 24).convertToFormat(QImage.Format_RGB32)
+            r = g = b = n = 0
+            for y in range(img.height()):
+                for x in range(img.width()):
+                    c = img.pixel(x, y)
+                    r += (c >> 16) & 255
+                    g += (c >> 8) & 255
+                    b += c & 255
+                    n += 1
+            if n:
+                col = (r / n / 255.0, g / n / 255.0, b / n / 255.0)
+    except Exception:  # noqa: BLE001
+        col = None
+    _AVG_COLOR_CACHE[path] = col
+    return col
+
+
+def _emit_blade(buf, root: QVector3D, nrm: QVector3D, tint, rng) -> None:
+    """Añade una hoja de césped (5 vértices → 3 triángulos) al buffer.
+
+    Se hace todo con ``float`` sueltos (sin objetos ``QVector3D`` ni closures)
+    porque esto corre cientos de miles de veces y el coste se nota."""
+    ux, uy, uz = nrm.x(), nrm.y(), nrm.z()
+    ul = math.sqrt(ux * ux + uy * uy + uz * uz)
+    if ul < 1e-9:
+        ux, uy, uz = 0.0, 0.0, 1.0
+    else:
+        ux, uy, uz = ux / ul, uy / ul, uz / ul
+
+    if abs(uz) < 0.9:
+        rx, ry, rz = 0.0, 0.0, 1.0
+    else:
+        rx, ry, rz = 1.0, 0.0, 0.0
+
+    # side0 = ref × up
+    sx = ry * uz - rz * uy
+    sy = rz * ux - rx * uz
+    sz = rx * uy - ry * ux
+    sl = math.sqrt(sx * sx + sy * sy + sz * sz)
+    if sl < 1e-9:
+        sx, sy, sz = 1.0, 0.0, 0.0
+    else:
+        sx, sy, sz = sx / sl, sy / sl, sz / sl
+    # fwd0 = up × side0
+    fx = uy * sz - uz * sy
+    fy = uz * sx - ux * sz
+    fz = ux * sy - uy * sx
+
+    ang = rng.random() * 6.2831853
+    ca = math.cos(ang)
+    sa = math.sin(ang)
+    # side y fwd son side0/fwd0 girados en su plano → siguen siendo unitarios
+    wx = sx * ca + fx * sa
+    wy = sy * ca + fy * sa
+    wz = sz * ca + fz * sa
+    dx = fx * ca - sx * sa
+    dy = fy * ca - sy * sa
+    dz = fz * ca - sz * sa
+
+    h = GRASS_HEIGHT * (0.6 + 0.8 * rng.random())
+    wid = GRASS_WIDTH * (0.7 + 0.6 * rng.random())
+    lean = h * (0.15 + 0.55 * rng.random())
+
+    bx = root.x() + ux * 0.004        # separación del suelo (evita z-fight)
+    by = root.y() + uy * 0.004
+    bz = root.z() + uz * 0.004
+
+    # face_n = fwd × up ; n_v = normalize(face_n*0.6 + up*0.5)
+    fnx = dy * uz - dz * uy
+    fny = dz * ux - dx * uz
+    fnz = dx * uy - dy * ux
+    nvx = fnx * 0.6 + ux * 0.5
+    nvy = fny * 0.6 + uy * 0.5
+    nvz = fnz * 0.6 + uz * 0.5
+    nl = math.sqrt(nvx * nvx + nvy * nvy + nvz * nvz)
+    if nl > 1e-9:
+        nvx, nvy, nvz = nvx / nl, nvy / nl, nvz / nl
+
+    shade = 0.80 + 0.40 * rng.random()
+    t0, t1, t2 = tint
+    c0r, c0g, c0b = t0 * 0.50 * shade, t1 * 0.52 * shade, t2 * 0.50 * shade
+    c1r, c1g, c1b = t0 * 0.90 * shade, t1 * 0.92 * shade, t2 * 0.85 * shade
+    c2r = min(1.0, t0 * 1.12) * shade
+    c2g = min(1.0, t1 * 1.16) * shade
+    c2b = min(1.0, t2 * 0.95) * shade
+    flex = 0.60 + 0.50 * rng.random()
+    phase = rng.random() * 6.2831853 + (root.x() + root.y()) * 0.6
+
+    hl = wid * 0.5
+    blx, bly, blz = bx - wx * hl, by - wy * hl, bz - wz * hl
+    brx, bry, brz = bx + wx * hl, by + wy * hl, bz + wz * hl
+    mh = h * 0.55
+    ml = lean * 0.30
+    mwx, mwy, mwz = bx + ux * mh + dx * ml, by + uy * mh + dy * ml, bz + uz * mh + dz * ml
+    m2 = wid * 0.30
+    mlx, mly, mlz = mwx - wx * m2, mwy - wy * m2, mwz - wz * m2
+    mrx, mry, mrz = mwx + wx * m2, mwy + wy * m2, mwz + wz * m2
+    tipx, tipy, tipz = bx + ux * h + dx * lean, by + uy * h + dy * lean, bz + uz * h + dz * lean
+
+    nx, ny, nz = nvx, nvy, nvz
+    buf.extend((
+        blx, bly, blz, nx, ny, nz, c0r, c0g, c0b, 0.0, phase, flex, h,
+        brx, bry, brz, nx, ny, nz, c0r, c0g, c0b, 0.0, phase, flex, h,
+        mrx, mry, mrz, nx, ny, nz, c1r, c1g, c1b, 0.55, phase, flex, h,
+        blx, bly, blz, nx, ny, nz, c0r, c0g, c0b, 0.0, phase, flex, h,
+        mrx, mry, mrz, nx, ny, nz, c1r, c1g, c1b, 0.55, phase, flex, h,
+        mlx, mly, mlz, nx, ny, nz, c1r, c1g, c1b, 0.55, phase, flex, h,
+        mlx, mly, mlz, nx, ny, nz, c1r, c1g, c1b, 0.55, phase, flex, h,
+        mrx, mry, mrz, nx, ny, nz, c1r, c1g, c1b, 0.55, phase, flex, h,
+        tipx, tipy, tipz, nx, ny, nz, c2r, c2g, c2b, 1.0, phase, flex, h,
+    ))
+
+
+def build_grass_geometry(faces, density: float, max_blades: int,
+                         seed: int = 12345):
+    """Siembra hojas 3D sobre las caras de césped.
+
+    ``faces`` es la lista que arma ``build_world_geometry`` (triángulos en
+    mundo + textura + color). Devuelve ``(bytes, vcount)`` listos para subir
+    a la GPU. Determinista por ``seed`` para que el césped no cambie de sitio
+    al reconstruir la escena por cambios ajenos."""
+    data = array("f")
+    if not faces or density <= 0.0:
+        return data, 0
+
+    # Reúne todos los triángulos con su color de hoja y calcula áreas.
+    tris = []          # (p0, p1, p2, tint)
+    cum = []
+    total = 0.0
+    for tlist, texpath, facecol in faces:
+        tint = _average_color(texpath) if texpath else None
+        if tint is None:
+            tint = _GRASS_FALLBACK
+        if facecol is not None:
+            tint = (tint[0] * facecol[0], tint[1] * facecol[1],
+                    tint[2] * facecol[2])
+        for tri in tlist:
+            p0, p1, p2 = tri
+            area = 0.5 * QVector3D.crossProduct(p1 - p0, p2 - p0).length()
+            if area <= 1e-9:
+                continue
+            total += area
+            tris.append((p0, p1, p2, tint))
+            cum.append(total)
+    if total <= 0.0 or not tris:
+        return data, 0
+
+    n_blades = int(min(float(max_blades), density * total))
+    if n_blades <= 0:
+        return data, 0
+
+    rng = random.Random(seed)
+    last = len(tris) - 1
+    for _ in range(n_blades):
+        r = rng.random() * total
+        j = bisect_left(cum, r)
+        if j < 0:
+            j = 0
+        elif j > last:
+            j = last
+        p0, p1, p2, tint = tris[j]
+        u = rng.random()
+        v = rng.random()
+        if u + v > 1.0:
+            u = 1.0 - u
+            v = 1.0 - v
+        root = p0 + (p1 - p0) * u + (p2 - p0) * v
+        n = QVector3D.crossProduct(p1 - p0, p2 - p0)
+        ln = n.length()
+        n = (n / ln) if ln > 1e-9 else QVector3D(0.0, 0.0, 1.0)
+        _emit_blade(data, root, n, tint, rng)
+
+    vcount = len(data) // (G_STRIDE // 4)
+    return data, vcount
 
 
 def build_world_geometry(scene) -> WorldGeometry:
@@ -476,12 +847,17 @@ def build_world_geometry(scene) -> WorldGeometry:
             key = (texpath, round(rough, 3), round(metal, 3),
                    round(trans, 3), round(opacity, 3))
             bucket = _bucket(key, texpath)
+            grass = _is_grass(texpath, matname)
+            glist = [] if grass else None
         except Exception:  # noqa: BLE001 — una cara mala no tira la escena
             continue
 
         for tri in tris:
+            wps = [] if glist is not None else None
             for p in tri:
                 wp = matrix.map(p) if matrix is not None else p
+                if wps is not None:
+                    wps.append(wp)
                 _grow(wp)
                 if gu is not None:
                     u = QVector3D.dotProduct(gu, wp) + cu
@@ -493,6 +869,10 @@ def build_world_geometry(scene) -> WorldGeometry:
                                u, v,
                                color[0], color[1], color[2],
                                rough, metal, trans))
+            if wps is not None and len(wps) >= 3:
+                glist.append((wps[0], wps[1], wps[2]))
+        if glist:
+            geo.grass_faces.append((glist, texpath, color))
         count += 1
 
     geo.faces = count
@@ -588,16 +968,22 @@ class WorldView(QOpenGLWidget):
         self._prog = None
         self._sky = None
         self._depth = None
+        self._gprog = None
         self._vao = None
         self._empty_vao = None
         self._vbo = None
+        self._gvao = None
+        self._gvbo = None
         self._shadow_fbo = None
         self._textures: dict = {}
         self._lm: dict = {}
         self._ls: dict = {}
         self._ld: dict = {}
+        self._lg: dict = {}
         self._runs: list[_DrawRun] = []
         self._vcount = 0
+        self._gcount = 0
+        self._time = 0.0
         self._built_version = None
         self._dirty = True
         self._want_frame = True
@@ -609,6 +995,10 @@ class WorldView(QOpenGLWidget):
         self.ambient = 0.55
         self.exposure = 1.05
         self.shadow_strength = 0.62
+        self.grass = True
+        self.wind = True
+        self.grass_density = 45.0
+        self._shadow_dirty = True
 
         self._keys: set = set()
         self._looking = False
@@ -631,10 +1021,12 @@ class WorldView(QOpenGLWidget):
     def _tick(self) -> None:
         if not self.isVisible():
             return
+        self._time = self._clock.elapsed() / 1000.0
         moved = bool(self._keys) or self._looking
         if moved:
             self._apply_movement()
-        if moved or self._dirty:
+        animate = self.wind and self._gcount > 0
+        if moved or self._dirty or animate:
             self.update()
 
     def _apply_movement(self) -> None:
@@ -670,15 +1062,21 @@ class WorldView(QOpenGLWidget):
         self._prog = self._compile(_VERT, _FRAG, "principal")
         self._sky = self._compile(_SKY_VERT, _SKY_FRAG, "cielo")
         self._depth = self._compile(_DEPTH_VERT, _DEPTH_FRAG, "sombras")
+        self._gprog = self._compile(_GRASS_VERT, _GRASS_FRAG, "césped")
         self._lm = self._locs_for(self._prog, _MAIN_UNIFORMS) if self._prog else {}
         self._ls = self._locs_for(self._sky, _SKY_UNIFORMS) if self._sky else {}
         self._ld = self._locs_for(self._depth, _DEPTH_UNIFORMS) if self._depth else {}
+        self._lg = self._locs_for(self._gprog, _GRASS_UNIFORMS) if self._gprog else {}
         self._vao = QOpenGLVertexArrayObject(self)
         self._vao.create()
         self._empty_vao = QOpenGLVertexArrayObject(self)
         self._empty_vao.create()
         self._vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
         self._vbo.create()
+        self._gvao = QOpenGLVertexArrayObject(self)
+        self._gvao.create()
+        self._gvbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        self._gvbo.create()
         self._gl.glEnable(GL_DEPTH_TEST)
         self._gl.glDepthFunc(GL_LEQUAL)
         self._gl.glEnable(GL_MULTISAMPLE)
@@ -792,15 +1190,51 @@ class WorldView(QOpenGLWidget):
             self._prog.release()
         self._vao.release()
         self._vbo.release()
+        self._upload_grass(geo)
         n_tex = len({r.texture for r in self._runs if r.texture})
+        blades = self._gcount // 9
+        extra = f" · {blades} hojas" if blades else ""
         self._stats = (f"{geo.faces} caras · {self._vcount // 3} triángulos · "
-                       f"{len(self._runs)} materiales · {n_tex} texturas")
+                       f"{len(self._runs)} materiales · {n_tex} texturas{extra}")
         self._built_version = self._scene_version()
         self._dirty = False
         self._update_light()
         if self._want_frame and self._bounds is not None:
             self._want_frame = False
             self.frame_scene()
+
+    def _upload_grass(self, geo) -> None:
+        """Siembra y sube el césped 3D (0 hojas si la densidad es 0).
+
+        Se construye siempre (aunque el césped esté oculto) para que el
+        interruptor sea instantáneo, sin rehacer toda la geometría."""
+        density = max(0.0, float(self.grass_density))
+        data, gcount = build_grass_geometry(geo.grass_faces, density,
+                                            GRASS_MAX_BLADES)
+        self._gcount = gcount
+        blob = data.tobytes()
+        self._gvbo.bind()
+        if blob:
+            try:
+                self._gvbo.allocate(blob, len(blob))
+            except TypeError:
+                self._gvbo.allocate(blob)
+        else:
+            try:
+                self._gvbo.allocate(4)
+            except Exception:  # noqa: BLE001
+                pass
+        self._gvao.bind()
+        if self._gprog is not None:
+            self._gprog.bind()
+            for loc, offset, size in ((0, G_POS, 3), (1, G_NRM, 3),
+                                      (2, G_COL, 3), (3, G_DATA, 4)):
+                self._gprog.enableAttributeArray(loc)
+                self._gprog.setAttributeBuffer(loc, GL_FLOAT, offset, size,
+                                               G_STRIDE)
+            self._gprog.release()
+        self._gvao.release()
+        self._gvbo.release()
 
     def _update_light(self) -> None:
         scene = getattr(self.app.viewport, "scene", None)
@@ -854,6 +1288,7 @@ class WorldView(QOpenGLWidget):
         proj = QMatrix4x4()
         proj.ortho(-r, r, -r, r, r * 0.5, r * 3.5)
         self._light_vp = proj * view
+        self._shadow_dirty = True
 
     def _ensure_shadow_fbo(self):
         if self._shadow_fbo is not None:
@@ -907,22 +1342,25 @@ class WorldView(QOpenGLWidget):
 
         sky_col, gnd_col, sun_col, reflect = self._palette()
 
-        # --- mapa de sombras ---
+        # --- mapa de sombras (solo se rehace si cambió la escena: la matriz
+        # de luz no depende de la cámara) ---
         shadow_tex = 0
         if self.shadows and self._depth is not None and self._vcount:
             fbo = self._ensure_shadow_fbo()
             if fbo is not None:
-                fbo.bind()
-                gl.glViewport(0, 0, SHADOW_SIZE, SHADOW_SIZE)
-                gl.glClearColor(1.0, 1.0, 1.0, 1.0)
-                gl.glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-                self._depth.bind()
-                self._sv(self._depth, self._ld, "u_light_vp", self._light_vp)
-                self._vao.bind()
-                gl.glDrawArrays(GL_TRIANGLES, 0, self._vcount)
-                self._vao.release()
-                self._depth.release()
-                fbo.release()
+                if self._shadow_dirty:
+                    fbo.bind()
+                    gl.glViewport(0, 0, SHADOW_SIZE, SHADOW_SIZE)
+                    gl.glClearColor(1.0, 1.0, 1.0, 1.0)
+                    gl.glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+                    self._depth.bind()
+                    self._sv(self._depth, self._ld, "u_light_vp", self._light_vp)
+                    self._vao.bind()
+                    gl.glDrawArrays(GL_TRIANGLES, 0, self._vcount)
+                    self._vao.release()
+                    self._depth.release()
+                    fbo.release()
+                    self._shadow_dirty = False
                 shadow_tex = fbo.texture()
 
         # --- frame por defecto del widget ---
@@ -1017,6 +1455,44 @@ class WorldView(QOpenGLWidget):
             self._vao.release()
             self._prog.release()
 
+        # --- césped 3D (opaco, recibe sombras) ---
+        if self.grass and self._gcount and self._gprog is not None:
+            gprog = self._gprog
+            gprog.bind()
+            self._sv(gprog, self._lg, "u_mvp", mvp)
+            self._sv(gprog, self._lg, "u_cam", self.camera.pos)
+            self._sv(gprog, self._lg, "u_sun_dir", self._sun_dir)
+            self._sv(gprog, self._lg, "u_sun_col", sun_col)
+            self._sv(gprog, self._lg, "u_sky_col", sky_col)
+            self._sv(gprog, self._lg, "u_gnd_col", gnd_col)
+            self._sv(gprog, self._lg, "u_ambient", self.ambient)
+            self._sv(gprog, self._lg, "u_exposure", self.exposure)
+            self._sv(gprog, self._lg, "u_shadow_strength", self.shadow_strength)
+            self._sv(gprog, self._lg, "u_light_vp", self._light_vp)
+            use_shadow = 1 if (self.shadows and shadow_tex) else 0
+            self._sv(gprog, self._lg, "u_shadow_enable", use_shadow)
+            self._sv(gprog, self._lg, "u_shadow", 1)
+            self._sv(gprog, self._lg, "u_time",
+                     self._time if self.wind else 0.0)
+            wdx, wdy = WIND_DIR
+            self._sv(gprog, self._lg, "u_wind_dir", QVector2D(wdx, wdy))
+            self._sv(gprog, self._lg, "u_wind_strength",
+                     WIND_STRENGTH if self.wind else 0.0)
+            if shadow_tex:
+                gl.glActiveTexture(GL_TEXTURE1)
+                gl.glBindTexture(GL_TEXTURE_2D, int(shadow_tex))
+                gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+                gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+                gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                                   GL_CLAMP_TO_EDGE)
+                gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                                   GL_CLAMP_TO_EDGE)
+                gl.glActiveTexture(GL_TEXTURE0)
+            self._gvao.bind()
+            gl.glDrawArrays(GL_TRIANGLES, 0, self._gcount)
+            self._gvao.release()
+            gprog.release()
+
         self._draw_hud(w, h)
 
     def _palette(self):
@@ -1042,7 +1518,8 @@ class WorldView(QOpenGLWidget):
             lines = [
                 "ViReal — ratón: mirar (arrastra) · W/A/S/D: mover · "
                 "Q/E: bajar/subir · rueda: acercar",
-                "Shift: correr · R: reencuadrar · T: sombras",
+                "Shift: correr · R: reencuadrar · T: sombras · "
+                "C: césped · V: viento",
             ]
             if self._stats:
                 lines.append(self._stats)
@@ -1077,6 +1554,14 @@ class WorldView(QOpenGLWidget):
             return
         if k == Qt.Key_T:
             self.shadows = not self.shadows
+            self.update()
+            return
+        if k == Qt.Key_C:
+            self.grass = not self.grass
+            self.update()
+            return
+        if k == Qt.Key_V:
+            self.wind = not self.wind
             self.update()
             return
         self._keys.add(k)
@@ -1160,6 +1645,20 @@ class WorldWindow(QDialog):
         self.chk_shadows.toggled.connect(self._on_shadows)
         lay.addWidget(self.chk_shadows)
 
+        self.chk_grass = QCheckBox("Césped 3D", bar)
+        self.chk_grass.setChecked(True)
+        self.chk_grass.setToolTip(
+            "Hojas 3D que se mecen con el viento sobre las superficies con "
+            "textura de césped/grass (tecla C)")
+        self.chk_grass.toggled.connect(self._on_grass)
+        lay.addWidget(self.chk_grass)
+
+        self.chk_wind = QCheckBox("Viento", bar)
+        self.chk_wind.setChecked(True)
+        self.chk_wind.setToolTip("Anima el césped (tecla V)")
+        self.chk_wind.toggled.connect(self._on_wind)
+        lay.addWidget(self.chk_wind)
+
         lay.addWidget(QLabel("Exposición", bar))
         self.spin_exp = QDoubleSpinBox(bar)
         self.spin_exp.setRange(0.2, 3.0)
@@ -1178,6 +1677,17 @@ class WorldWindow(QDialog):
         self.spin_amb.valueChanged.connect(self._on_ambient)
         lay.addWidget(self.spin_amb)
 
+        lay.addWidget(QLabel("Césped/m²", bar))
+        self.spin_grass = QDoubleSpinBox(bar)
+        self.spin_grass.setRange(0.0, 200.0)
+        self.spin_grass.setSingleStep(5.0)
+        self.spin_grass.setDecimals(0)
+        self.spin_grass.setValue(45.0)
+        self.spin_grass.setToolTip("Densidad de hojas por metro cuadrado de "
+                                   "césped (0 = sin césped)")
+        self.spin_grass.valueChanged.connect(self._on_density)
+        lay.addWidget(self.spin_grass)
+
         lay.addStretch(1)
         hint = QLabel("arrastra para mirar · W/A/S/D mover · Esc cerrar", bar)
         hint.setEnabled(False)
@@ -1186,7 +1696,6 @@ class WorldWindow(QDialog):
 
     def _on_shadows(self, on: bool) -> None:
         self.view.shadows = bool(on)
-        self.view.mark_dirty()
         self.view.update()
 
     def _on_exposure(self, v: float) -> None:
@@ -1197,6 +1706,19 @@ class WorldWindow(QDialog):
         self.view.ambient = float(v)
         self.view.update()
 
+    def _on_grass(self, on: bool) -> None:
+        self.view.grass = bool(on)
+        self.view.update()
+
+    def _on_wind(self, on: bool) -> None:
+        self.view.wind = bool(on)
+        self.view.update()
+
+    def _on_density(self, v: float) -> None:
+        self.view.grass_density = float(v)
+        self.view.mark_dirty()
+        self.view.update()
+
     def _load_view_state(self) -> None:
         s = self.settings
         try:
@@ -1204,9 +1726,18 @@ class WorldWindow(QDialog):
                                             "true")).lower() in ("1", "true")
             self.view.exposure = float(s.value(_SETTINGS + "exposure", 1.05))
             self.view.ambient = float(s.value(_SETTINGS + "ambient", 0.55))
+            self.view.grass = str(s.value(_SETTINGS + "grass",
+                                          "true")).lower() in ("1", "true")
+            self.view.wind = str(s.value(_SETTINGS + "wind",
+                                         "true")).lower() in ("1", "true")
+            self.view.grass_density = float(
+                s.value(_SETTINGS + "grass_density", 45.0))
             self.chk_shadows.setChecked(self.view.shadows)
             self.spin_exp.setValue(self.view.exposure)
             self.spin_amb.setValue(self.view.ambient)
+            self.chk_grass.setChecked(self.view.grass)
+            self.chk_wind.setChecked(self.view.wind)
+            self.spin_grass.setValue(self.view.grass_density)
         except (TypeError, ValueError):
             pass
 
@@ -1215,6 +1746,9 @@ class WorldWindow(QDialog):
         s.setValue(_SETTINGS + "shadows", self.view.shadows)
         s.setValue(_SETTINGS + "exposure", self.view.exposure)
         s.setValue(_SETTINGS + "ambient", self.view.ambient)
+        s.setValue(_SETTINGS + "grass", self.view.grass)
+        s.setValue(_SETTINGS + "wind", self.view.wind)
+        s.setValue(_SETTINGS + "grass_density", self.view.grass_density)
         s.sync()
 
     def closeEvent(self, ev) -> None:
@@ -1239,7 +1773,9 @@ class ViRealPanel(QWidget):
         note = QLabel(
             "Abre una ventana flotante con el modelo iluminado: texturas "
             "reales, sol y sombras, materiales con brillo (core.finish) y "
-            "cielo. Cámara libre tipo juego (W/A/S/D + ratón).", box)
+            "cielo. Césped 3D que se mece con el viento en las superficies "
+            "con textura de césped/grass. Cámara libre tipo juego "
+            "(W/A/S/D + ratón).", box)
         note.setWordWrap(True)
         bl.addWidget(note)
         btn = QPushButton("▶  Abrir ventana ViReal", box)

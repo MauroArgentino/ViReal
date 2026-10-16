@@ -8,7 +8,8 @@
     plugins de IngeTrazo.
 
 .PARAMETER Version
-    Versión a empaquetar. Por defecto 0.1.0.
+    Versión a empaquetar. Si se omite, se toma del ``__version__`` de
+    vireal.py (así no se desincronizan).
 
 .PARAMETER Install
     Además de empaquetar, copia vireal.py a la carpeta de plugins de IngeTrazo
@@ -23,7 +24,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Version = "0.1.0",
+    [string]$Version = "",
     [switch]$Install
 )
 
@@ -33,6 +34,13 @@ $root = $PSScriptRoot
 $src = Join-Path $root "vireal.py"
 if (-not (Test-Path $src)) {
     throw "No encuentro vireal.py en $root"
+}
+
+if (-not $Version) {
+    $m = Select-String -Path $src -Pattern '__version__\s*=\s*"([^"]+)"'
+    if ($m) { $Version = $m.Matches[0].Groups[1].Value }
+    else { $Version = "0.0.0" }
+    Write-Host "Versión detectada en vireal.py: $Version"
 }
 
 $dist = Join-Path $root "dist"
