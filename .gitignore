@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Build
+dist/
+
+# Editores / IDE
+.vscode/
+.idea/
+*.swp
+*.sublime-*
+
+# Sistema operativo
+Thumbs.db
+Desktop.ini
+desktop.ini
+.DS_Store
