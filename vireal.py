@@ -23,6 +23,19 @@ Las superficies cuya textura o material se llame «césped»/«grass» (pasto,
 hierba, lawn, turf…) reciben **césped 3D**: miles de hojas sembradas sobre la
 cara que se mecen con el viento y reciben las sombras del sol.
 
+Desde 0.3.0 el motor es un *pipeline* HDR con post-proceso:
+
+* **Reflejos en tiempo real** (SSR, *screen-space reflections*) sobre las
+  superficies glossy — pisos, vidrio, metal — más un reflejo analítico del
+  cielo (IBL aproximado) que siempre está ahí aunque el SSR falle.
+* **Relieve** por *normal-map* derivado de la propia textura (bump): las
+  piedras, ladrillos y revestimientos se ven con volumen.
+* **Pisos brillantes** (glossy): un control baja la rugosidad de las caras
+  que miran hacia arriba para que reflejen como porcelanato pulido.
+* **Sombras suaves** (PCSS) con penumbra que crece con la distancia.
+* **Sombra ambiental** (SSAO) que asienta los objetos sobre el suelo.
+* **Bloom** solar y paletas de cielo (día, atardecer, nublado, noche).
+
 Instalar: copiar este archivo en la carpeta de plugins
 (Extensiones ▸ Abrir carpeta de plugins) y reiniciar IngeTrazo.
 """
@@ -53,11 +66,14 @@ from PySide6.QtOpenGL import (
     QOpenGLShader,
     QOpenGLShaderProgram,
     QOpenGLTexture,
+    QOpenGLVersionFunctionsFactory,
+    QOpenGLVersionProfile,
     QOpenGLVertexArrayObject,
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QDoubleSpinBox,
     QGroupBox,
@@ -71,7 +87,7 @@ from PySide6.QtWidgets import (
 log = logging.getLogger("ingetrazo.plugins.vireal")
 
 #: Versión de la extensión (coincide con el CHANGELOG y el paquete .zip).
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 _SETTINGS = "vireal/"
 
@@ -108,27 +124,47 @@ GL_TEXTURE_WRAP_S = 0x2802
 GL_TEXTURE_WRAP_T = 0x2803
 GL_LINEAR = 0x2601
 GL_RGBA8 = 0x8058
+GL_RGBA16F = 0x881A
 GL_CLAMP_TO_EDGE = 0x812F
 GL_MULTISAMPLE = 0x809D
+GL_TEXTURE2 = 0x84C2
+GL_TEXTURE3 = 0x84C3
+GL_TEXTURE4 = 0x84C4
+GL_FRAMEBUFFER = 0x8D40
+GL_COLOR_ATTACHMENT0 = 0x8CE0
+GL_COLOR_ATTACHMENT1 = 0x8CE1
+GL_COLOR_ATTACHMENT2 = 0x8CE2
 
 #: Nombres de los uniformes de cada programa (PySide6 exige ``bytes`` en
 #: ``uniformLocation`` y la localización para valores float/int).
 _MAIN_UNIFORMS = (
     "u_mvp", "u_cam", "u_sun_dir", "u_sun_col", "u_sky_col", "u_gnd_col",
-    "u_ambient", "u_exposure", "u_shadow_strength", "u_light_vp", "u_reflect",
+    "u_ambient", "u_shadow_strength", "u_light_vp",
     "u_shadow_enable", "u_shadow", "u_tex", "u_color", "u_opacity",
-    "u_use_texture",
+    "u_use_texture", "u_use_bump", "u_bump", "u_bump_strength",
+    "u_env", "u_floor_gloss",
 )
 _SKY_UNIFORMS = (
     "u_inv_vp", "u_cam", "u_sun_dir", "u_sun_col", "u_sky_col", "u_gnd_col",
-    "u_exposure",
 )
 _DEPTH_UNIFORMS = ("u_light_vp",)
 _GRASS_UNIFORMS = (
     "u_mvp", "u_cam", "u_sun_dir", "u_sun_col", "u_sky_col", "u_gnd_col",
-    "u_ambient", "u_exposure", "u_shadow_enable", "u_shadow",
+    "u_ambient", "u_shadow_enable", "u_shadow",
     "u_light_vp", "u_shadow_strength", "u_time", "u_wind_dir",
     "u_wind_strength",
+)
+_SSAO_UNIFORMS = (
+    "u_pos", "u_mat", "u_view", "u_proj", "u_texel", "u_radius", "u_bias",
+    "u_intensity",
+)
+_BRIGHT_UNIFORMS = ("u_tex", "u_threshold", "u_knee")
+_BLUR_UNIFORMS = ("u_tex", "u_dir", "u_texel")
+_COMPOSITE_UNIFORMS = (
+    "u_color", "u_ao", "u_bloom", "u_pos", "u_mat", "u_cam", "u_sun_dir",
+    "u_sun_col", "u_sky_col", "u_gnd_col", "u_view", "u_proj", "u_exposure",
+    "u_ao_strength", "u_bloom_amount", "u_env", "u_ssr_enable",
+    "u_ssr_strength", "u_vignette",
 )
 
 #: Tamaño del mapa de sombras (px).
@@ -156,6 +192,27 @@ G_DATA = 36
 _GRASS_WORDS = ("grass", "cesped", "pasto", "hierba", "lawn", "turf",
                 "grama", "tepe", "sod", "chacra")
 
+#: Materiales pisos que deben verse pulidos/glossy (porcelanato, mármol…).
+_GLOSS_WORDS = ("piso", "floor", "porcelanato", "porcelanic", "ceramic",
+                "ceramica", "ceramico", "marmol", "marble", "pulido",
+                "brillante", "glossy", "baldosa", "tile", "granito",
+                "granite", "microcemento", "laca", "terrazo", "vinilico")
+
+#: Materiales con relieve (piedra, ladrillo, adoquín, revestimiento…).
+_STONE_WORDS = ("piedra", "stone", "rock", "roca", "ladrillo", "brick",
+                "adoquin", "paving", "pavimento", "revestimiento", "muro",
+                "mamposteria", "block", "hormigon visto", "texturado",
+                "travertino", "laja", "canto", "aspero", "rugoso")
+
+#: Paletas de cielo: (etiqueta, cielo, suelo, sol). El sol se tiñe con la
+#: elevación real, así que estas son sólo el color base.
+_SKY_PRESETS = (
+    ("Día", (0.46, 0.64, 0.92), (0.30, 0.29, 0.27), (1.00, 0.96, 0.88)),
+    ("Atardecer", (0.66, 0.52, 0.58), (0.24, 0.19, 0.17), (1.00, 0.62, 0.32)),
+    ("Nublado", (0.74, 0.77, 0.81), (0.36, 0.36, 0.35), (0.92, 0.93, 0.95)),
+    ("Noche", (0.045, 0.06, 0.12), (0.02, 0.025, 0.04), (0.32, 0.38, 0.58)),
+)
+
 #: Color de la hoja cuando no se puede leer la textura del suelo.
 _GRASS_FALLBACK = (0.30, 0.45, 0.17)
 
@@ -172,6 +229,9 @@ WIND_STRENGTH = 0.05
 
 #: Caché del color medio de las texturas (para teñir las hojas).
 _AVG_COLOR_CACHE: dict = {}
+
+#: Caché de los normal-map generados a partir de la textura (relieve).
+_NORMAL_CACHE: dict = {}
 
 
 # ---------------------------------------------------------------------------
@@ -216,19 +276,44 @@ uniform float u_ambient;
 uniform vec3 u_color;        // tinte extra (normalmente blanco)
 uniform int u_use_texture;
 uniform sampler2D u_tex;
+uniform int u_use_bump;
+uniform sampler2D u_bump;    // normal-map derivado de la textura (relieve)
+uniform float u_bump_strength;
+uniform float u_env;         // intensidad de los reflejos de entorno (IBL)
+uniform float u_floor_gloss; // 0..1: vuelve las caras hacia arriba pulidas
 uniform int u_shadow_enable;
 uniform sampler2D u_shadow;
 uniform mat4 u_light_vp;
 uniform float u_shadow_strength;
-uniform float u_exposure;
 uniform float u_opacity;
-uniform vec3 u_reflect;      // color del reflejo (cielo) para vidrio/agua
-out vec4 fragColor;
+layout(location = 0) out vec4 out_color;  // radiancia HDR (sin tonemap)
+layout(location = 1) out vec4 out_mat;    // normal.xyz + rugosidad
+layout(location = 2) out vec4 out_pos;    // posición mundo + reflectividad
+
+const vec2 POISSON[12] = vec2[12](
+    vec2(-0.326, -0.406), vec2(-0.840, -0.074), vec2(-0.696, 0.457),
+    vec2(-0.203, 0.621), vec2(0.962, -0.195), vec2(0.473, -0.480),
+    vec2(0.519, 0.767), vec2(0.185, -0.893), vec2(0.507, 0.064),
+    vec2(0.896, 0.412), vec2(-0.322, -0.933), vec2(-0.792, -0.598)
+);
 
 float unpackDepth(vec3 e) {
     return dot(e, vec3(1.0, 1.0 / 255.0, 1.0 / 65025.0));
 }
 
+// Mapa de entorno analítico: el mismo modelo que el shader del cielo, así los
+// reflejos son coherentes con lo que se ve de fondo (IBL aproximado).
+vec3 envSky(vec3 dir) {
+    float up = clamp(dir.z, -1.0, 1.0);
+    vec3 s = mix(u_gnd_col * 0.75, u_sky_col, smoothstep(-0.04, 0.55, up));
+    float sd = max(dot(dir, normalize(u_sun_dir)), 0.0);
+    s += u_sun_col * (pow(sd, 900.0) * 6.0 + pow(sd, 24.0) * 0.18);
+    return s * (0.35 + 0.65 * u_ambient);
+}
+
+// Sombras suaves (PCSS): se busca la profundidad media de los bloqueadores y
+// el radio del filtro crece con la penumbra, así las sombras lejanas quedan
+// más difusas que las que tocan el objeto.
 float shadowFactor(vec3 wpos, float ndl) {
     if (u_shadow_enable == 0) return 1.0;
     vec4 lp = u_light_vp * vec4(wpos, 1.0);
@@ -239,9 +324,7 @@ float shadowFactor(vec3 wpos, float ndl) {
     }
     vec2 texel = 1.0 / vec2(textureSize(u_shadow, 0));
     // Corrección del plano receptor (Isidoro): cada muestra compara la
-    // profundidad guardada con el plano del receptor evaluado EN esa
-    // muestra, no contra el fragmento central; así las caras rasantes al
-    // sol no se llenan de acné.
+    // profundidad guardada con el plano del receptor evaluado EN esa muestra.
     vec3 ddx = dFdx(uvz);
     vec3 ddy = dFdy(uvz);
     float det = ddx.x * ddy.y - ddx.y * ddy.x;
@@ -255,20 +338,28 @@ float shadowFactor(vec3 wpos, float ndl) {
         glen = 8.0;
     }
     float bias = 0.0006 + glen * texel.x * 1.5;
-    float lit = 0.0;
-    for (int dx = -1; dx <= 1; dx++) {
-        for (int dy = -1; dy <= 1; dy++) {
-            vec2 off = vec2(dx, dy) * texel;
-            float d = unpackDepth(texture(u_shadow, uvz.xy + off).rgb);
-            lit += (uvz.z + dot(grad, off) - bias <= d) ? 1.0 : 0.0;
+
+    float blockerSum = 0.0;
+    float blockerCnt = 0.0;
+    for (int i = 0; i < 12; i++) {
+        vec2 off = POISSON[i] * texel * 3.0;
+        float d = unpackDepth(texture(u_shadow, uvz.xy + off).rgb);
+        if (uvz.z + dot(grad, off) - bias > d) {
+            blockerSum += d;
+            blockerCnt += 1.0;
         }
     }
-    return mix(1.0, lit / 9.0, u_shadow_strength);
-}
-
-vec3 aces(vec3 x) {
-    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
-    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+    if (blockerCnt < 0.5) return 1.0;
+    float avgB = blockerSum / blockerCnt;
+    float penumbra = clamp((uvz.z - avgB) / max(avgB, 1e-4), 0.0, 1.0);
+    float radius = mix(1.0, 24.0, penumbra);
+    float lit = 0.0;
+    for (int i = 0; i < 12; i++) {
+        vec2 off = POISSON[i] * texel * radius;
+        float d = unpackDepth(texture(u_shadow, uvz.xy + off).rgb);
+        lit += (uvz.z + dot(grad, off) - bias <= d) ? 1.0 : 0.0;
+    }
+    return mix(1.0, lit / 12.0, u_shadow_strength);
 }
 
 void main() {
@@ -285,6 +376,30 @@ void main() {
     vec3 N = normalize(v_nrm);
     vec3 V = normalize(u_cam - v_world);
     if (dot(N, V) < 0.0) N = -N;          // sombreado a dos caras
+
+    // Pisos brillantes: las caras que miran hacia arriba se pulen.
+    float upFacing = smoothstep(0.55, 0.95, N.z);
+    rough = mix(rough, 0.06, upFacing * u_floor_gloss);
+    metal = max(metal, upFacing * u_floor_gloss * 0.20);
+
+    // Relieve: normal-map derivado de la textura. La base tangente se obtiene
+    // de las derivadas (marco cotangente de Christian Schüler).
+    if (u_use_bump == 1 && u_bump_strength > 0.001) {
+        vec3 nm = texture(u_bump, v_uv).xyz * 2.0 - 1.0;
+        nm.xy *= u_bump_strength;
+        vec3 dp1 = dFdx(v_world);
+        vec3 dp2 = dFdy(v_world);
+        vec2 duv1 = dFdx(v_uv);
+        vec2 duv2 = dFdy(v_uv);
+        vec3 dp2perp = cross(dp2, N);
+        vec3 dp1perp = cross(N, dp1);
+        vec3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+        vec3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+        float im = inversesqrt(max(dot(T, T), dot(B, B)) + 1e-8);
+        mat3 TBN = mat3(T * im, B * im, N);
+        N = normalize(TBN * normalize(nm));
+    }
+
     vec3 L = normalize(u_sun_dir);
     float ndl = max(dot(N, L), 0.0);
     float ndv = max(dot(N, V), 1e-3);
@@ -311,18 +426,26 @@ void main() {
     float hemi = N.z * 0.5 + 0.5;
     vec3 amb = albedo * mix(u_gnd_col, u_sky_col, hemi) * u_ambient;
 
-    vec3 col = direct + amb;
+    // Reflejo del entorno (IBL aproximado): Fresnel y rugosidad.
+    vec3 R = reflect(-V, N);
+    vec3 env = envSky(R);
+    vec3 avgEnv = mix(u_gnd_col, u_sky_col, 0.55) * (0.35 + 0.65 * u_ambient);
+    env = mix(avgEnv, env, 1.0 - rough);
+    float fres = pow(1.0 - ndv, 5.0);
+    vec3 Fenv = F0 + (1.0 - F0) * fres;
+    vec3 ambientSpec = env * Fenv * (1.0 - rough) * u_env;
+
+    vec3 col = direct + amb + ambientSpec;
 
     if (trans > 0.0) {
-        float fres = pow(1.0 - ndv, 3.0);
-        vec3 refl = u_reflect * (0.25 + 0.75 * fres);
+        float fres2 = pow(1.0 - ndv, 3.0);
+        vec3 refl = mix(avgEnv, env, 0.7) * (0.25 + 0.75 * fres2);
         col = mix(col, refl + amb * 0.6, clamp(trans * 0.9, 0.0, 1.0));
     }
 
-    col *= u_exposure;
-    col = aces(col);
-    col = pow(col, vec3(1.0 / 2.2));
-    fragColor = vec4(col, u_opacity * base.a);
+    out_color = vec4(col, u_opacity * base.a);
+    out_mat = vec4(N, rough);
+    out_pos = vec4(v_world, 1.0 - rough);
 }
 """
 
@@ -346,13 +469,9 @@ uniform vec3 u_sun_dir;
 uniform vec3 u_sun_col;
 uniform vec3 u_sky_col;
 uniform vec3 u_gnd_col;
-uniform float u_exposure;
-out vec4 fragColor;
-
-vec3 aces(vec3 x) {
-    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
-    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
-}
+layout(location = 0) out vec4 out_color;
+layout(location = 1) out vec4 out_mat;
+layout(location = 2) out vec4 out_pos;
 
 void main() {
     vec4 far = u_inv_vp * vec4(v_ndc, 1.0, 1.0);
@@ -360,12 +479,12 @@ void main() {
     float up = clamp(dir.z, -1.0, 1.0);
     vec3 sky = mix(u_gnd_col * 0.75, u_sky_col,
                    smoothstep(-0.04, 0.55, up));
-    // halo y disco solar
+    // halo y disco solar (en HDR: el tonemap y el bloom van en el post)
     float sd = max(dot(dir, normalize(u_sun_dir)), 0.0);
-    sky += u_sun_col * (pow(sd, 900.0) * 6.0 + pow(sd, 24.0) * 0.18);
-    sky *= u_exposure;
-    sky = aces(sky);
-    fragColor = vec4(pow(sky, vec3(1.0 / 2.2)), 1.0);
+    sky += u_sun_col * (pow(sd, 900.0) * 8.0 + pow(sd, 24.0) * 0.22);
+    out_color = vec4(sky, 1.0);
+    out_mat = vec4(0.0);   // el cielo no tiene normal: se salta SSR/SSAO
+    out_pos = vec4(0.0);
 }
 """
 
@@ -445,12 +564,13 @@ uniform vec3 u_sun_col;
 uniform vec3 u_sky_col;
 uniform vec3 u_gnd_col;
 uniform float u_ambient;
-uniform float u_exposure;
 uniform int u_shadow_enable;
 uniform sampler2D u_shadow;
 uniform mat4 u_light_vp;
 uniform float u_shadow_strength;
-out vec4 fragColor;
+layout(location = 0) out vec4 out_color;
+layout(location = 1) out vec4 out_mat;
+layout(location = 2) out vec4 out_pos;
 
 float unpackDepth(vec3 e) {
     return dot(e, vec3(1.0, 1.0 / 255.0, 1.0 / 65025.0));
@@ -486,11 +606,6 @@ float grassShadow(vec3 wpos) {
     return mix(1.0, lit / 9.0, u_shadow_strength);
 }
 
-vec3 aces(vec3 x) {
-    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
-    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
-}
-
 void main() {
     vec3 albedo = v_col;
     vec3 N = normalize(v_nrm);
@@ -507,9 +622,227 @@ void main() {
     // Translucencia aproximada: las puntas dejan pasar algo de sol.
     col += albedo * u_sun_col * 0.07 * v_t * sh;
 
+    out_color = vec4(col, 1.0);
+    out_mat = vec4(N, 0.95);   // el césped es difuso: sin SSR
+    out_pos = vec4(v_world, 0.05);
+}
+"""
+
+# --- Post-proceso ---------------------------------------------------------
+_FS_VERT = """
+#version 330 core
+out vec2 v_uv;
+void main() {
+    vec2 p = vec2((gl_VertexID == 1) ? 3.0 : -1.0,
+                  (gl_VertexID == 2) ? 3.0 : -1.0);
+    v_uv = p * 0.5 + 0.5;
+    gl_Position = vec4(p, 0.0, 1.0);
+}
+"""
+
+_SSAO_FRAG = """
+#version 330 core
+in vec2 v_uv;
+uniform sampler2D u_pos;
+uniform sampler2D u_mat;
+uniform mat4 u_view;
+uniform mat4 u_proj;
+uniform vec2 u_texel;
+uniform float u_radius;
+uniform float u_bias;
+uniform float u_intensity;
+out vec4 fragColor;
+
+const vec3 KERNEL[16] = vec3[16](
+    vec3(0.52, 0.13, 0.30), vec3(-0.41, 0.58, 0.22),
+    vec3(0.17, -0.62, 0.35), vec3(-0.55, -0.20, 0.41),
+    vec3(0.68, 0.42, 0.18), vec3(-0.28, 0.71, 0.29),
+    vec3(0.34, -0.44, 0.52), vec3(-0.62, 0.11, 0.33),
+    vec3(0.11, 0.25, 0.72), vec3(-0.19, -0.33, 0.58),
+    vec3(0.45, 0.55, 0.44), vec3(-0.47, 0.40, 0.50),
+    vec3(0.60, -0.15, 0.28), vec3(-0.08, 0.52, 0.63),
+    vec3(0.24, -0.66, 0.30), vec3(-0.33, -0.50, 0.46)
+);
+
+float viewDepth(vec3 w) {
+    return -(u_view * vec4(w, 1.0)).z;
+}
+
+float hash(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+
+void main() {
+    vec4 mp = texture(u_pos, v_uv);
+    vec3 P = mp.xyz;
+    vec3 N = texture(u_mat, v_uv).xyz;
+    if (length(N) < 0.2 || length(P) < 1e-4) {
+        fragColor = vec4(1.0);
+        return;
+    }
+    N = normalize(N);
+
+    // Base aleatoria -> TBN.
+    float a = hash(v_uv * 1024.0) * 6.2831853;
+    vec3 rnd = vec3(cos(a), sin(a), 0.0);
+    vec3 T = normalize(rnd - N * dot(rnd, N));
+    vec3 B = cross(N, T);
+    mat3 TBN = mat3(T, B, N);
+
+    float pz = viewDepth(P);
+    float occl = 0.0;
+    for (int i = 0; i < 16; i++) {
+        vec3 sp = P + TBN * (KERNEL[i] * u_radius);
+        vec4 clip = u_proj * u_view * vec4(sp, 1.0);
+        if (clip.w <= 0.0) continue;
+        vec2 suv = clip.xy / clip.w * 0.5 + 0.5;
+        if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) {
+            continue;
+        }
+        vec4 smp = texture(u_pos, suv);
+        if (length(smp.xyz) < 1e-4) continue;
+        float sz = viewDepth(smp.xyz);
+        float sz2 = viewDepth(sp);
+        float rangeCheck = smoothstep(0.0, 1.0, u_radius / max(abs(pz - sz), 1e-4));
+        occl += (sz <= sz2 - u_bias) ? rangeCheck : 0.0;
+    }
+    float ao = clamp(1.0 - occl / 16.0 * u_intensity, 0.0, 1.0);
+    fragColor = vec4(ao, ao, ao, 1.0);
+}
+"""
+
+_BRIGHT_FRAG = """
+#version 330 core
+in vec2 v_uv;
+uniform sampler2D u_tex;
+uniform float u_threshold;
+uniform float u_knee;
+out vec4 fragColor;
+void main() {
+    vec3 c = texture(u_tex, v_uv).rgb;
+    float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    float k = clamp((l - u_threshold) / max(u_knee, 1e-3), 0.0, 1.0);
+    fragColor = vec4(c * k * k, 1.0);
+}
+"""
+
+_BLUR_FRAG = """
+#version 330 core
+in vec2 v_uv;
+uniform sampler2D u_tex;
+uniform vec2 u_dir;      // desplazamiento por muestra (en uv)
+out vec4 fragColor;
+void main() {
+    float w[5] = float[5](0.227027, 0.194594, 0.121621, 0.054054, 0.016216);
+    vec3 sum = texture(u_tex, v_uv).rgb * w[0];
+    for (int i = 1; i < 5; i++) {
+        sum += texture(u_tex, v_uv + u_dir * float(i)).rgb * w[i];
+        sum += texture(u_tex, v_uv - u_dir * float(i)).rgb * w[i];
+    }
+    fragColor = vec4(sum, 1.0);
+}
+"""
+
+_COMPOSITE_FRAG = """
+#version 330 core
+in vec2 v_uv;
+uniform sampler2D u_color;
+uniform sampler2D u_ao;
+uniform sampler2D u_bloom;
+uniform sampler2D u_pos;
+uniform sampler2D u_mat;
+uniform vec3 u_cam;
+uniform vec3 u_sun_dir;
+uniform vec3 u_sun_col;
+uniform vec3 u_sky_col;
+uniform vec3 u_gnd_col;
+uniform mat4 u_view;
+uniform mat4 u_proj;
+uniform float u_exposure;
+uniform float u_ao_strength;
+uniform float u_bloom_amount;
+uniform float u_env;
+uniform int u_ssr_enable;
+uniform float u_ssr_strength;
+uniform float u_vignette;
+out vec4 fragColor;
+
+vec3 aces(vec3 x) {
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+void main() {
+    vec3 col = texture(u_color, v_uv).rgb;
+
+    // Sombra ambiental.
+    float ao = texture(u_ao, v_uv).r;
+    col *= mix(1.0, ao, u_ao_strength);
+
+    // Reflejos en pantalla (SSR) sobre lo glossy.
+    if (u_ssr_enable == 1) {
+        vec3 N = texture(u_mat, v_uv).xyz;
+        float rough = texture(u_mat, v_uv).a;
+        vec3 P = texture(u_pos, v_uv).xyz;
+        if (length(N) > 0.2 && rough < 0.45 && length(P) > 1e-4) {
+            N = normalize(N);
+            vec3 V = normalize(u_cam - P);
+            float ndv = max(dot(N, V), 1e-3);
+            vec3 R = reflect(-V, N);
+            vec3 ray = P + N * 0.03;
+            float step = max(0.05, length(P - u_cam) * 0.01);
+            float conf = 0.0;
+            vec3 hitc = vec3(0.0);
+            vec2 lastUv = v_uv;
+            for (int i = 0; i < 28; i++) {
+                ray += R * step;
+                vec4 clip = u_proj * u_view * vec4(ray, 1.0);
+                if (clip.w <= 0.0) break;
+                vec2 suv = clip.xy / clip.w * 0.5 + 0.5;
+                if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) {
+                    break;
+                }
+                lastUv = suv;
+                vec3 swp = texture(u_pos, suv).xyz;
+                if (length(swp) > 1e-4) {
+                    float d = length(swp - ray);
+                    if (d < 0.10 * (1.0 + float(i) * 0.12)) {
+                        conf = 1.0 - float(i) / 28.0;
+                        hitc = texture(u_color, suv).rgb;
+                        break;
+                    }
+                }
+                step *= 1.08;
+            }
+            // Fundido cerca de los bordes (la info de pantalla se acaba ahí).
+            float edge = smoothstep(0.0, 0.08, lastUv.x)
+                       * smoothstep(1.0, 0.92, lastUv.x)
+                       * smoothstep(0.0, 0.08, lastUv.y)
+                       * smoothstep(1.0, 0.92, lastUv.y);
+            conf *= edge;
+            // Sólo se aplica donde hay impacto real: el reflejo del cielo ya
+            // lo puso el shader principal, así no se cuenta dos veces.
+            float fres = pow(1.0 - ndv, 4.0) * 0.8 + 0.2;
+            float gloss = 1.0 - rough;
+            float w = clamp(u_ssr_strength * gloss * fres * u_env * 2.0,
+                            0.0, 1.0);
+            col = mix(col, hitc, w * conf);
+        }
+    }
+
+    // Bloom.
+    col += texture(u_bloom, v_uv).rgb * u_bloom_amount;
+
+    // Exposición + tonemap + gamma.
     col *= u_exposure;
     col = aces(col);
     col = pow(col, vec3(1.0 / 2.2));
+
+    // Viñeta suave.
+    vec2 q = v_uv - 0.5;
+    float vig = 1.0 - u_vignette * dot(q, q) * 2.0;
+    col *= clamp(vig, 0.0, 1.0);
+
     fragColor = vec4(col, 1.0);
 }
 """
@@ -520,14 +853,15 @@ void main() {
 # ---------------------------------------------------------------------------
 class _DrawRun:
     __slots__ = ("texture", "rough", "metal", "trans", "opacity",
-                 "first", "count")
+                 "bump", "first", "count")
 
-    def __init__(self, texture, rough, metal, trans, opacity):
+    def __init__(self, texture, rough, metal, trans, opacity, bump=0.0):
         self.texture = texture
         self.rough = rough
         self.metal = metal
         self.trans = trans
         self.opacity = opacity
+        self.bump = bump
         self.first = 0
         self.count = 0
 
@@ -566,14 +900,34 @@ def _norm_words(text: str) -> str:
     return text
 
 
-def _is_grass(path=None, matname=None) -> bool:
-    """¿La textura (por nombre de archivo y carpeta) o el material es césped?"""
+def _haystack(path=None, matname=None) -> str:
+    """Texto de búsqueda (ruta + material) sin acentos ni separadores."""
     hay = ""
     if path:
         hay += " " + _norm_words(str(path).replace("\\", "/"))
     if matname:
         hay += " " + _norm_words(matname)
-    return any(w in hay for w in _GRASS_WORDS)
+    return hay
+
+
+def _is_grass(path=None, matname=None) -> bool:
+    """¿La textura (por nombre de archivo y carpeta) o el material es césped?"""
+    return any(w in _haystack(path, matname) for w in _GRASS_WORDS)
+
+
+def _is_glossy(path=None, matname=None) -> bool:
+    """¿Es un piso/material que debería verse pulido (glossy)?"""
+    return any(w in _haystack(path, matname) for w in _GLOSS_WORDS)
+
+
+def _is_stone(path=None, matname=None) -> bool:
+    """¿Es un material con relieve (piedra, ladrillo, adoquín…)?
+
+    Las superficies de césped no cuentan: su detalle lo da el césped 3D."""
+    hay = _haystack(path, matname)
+    if any(w in hay for w in _GRASS_WORDS):
+        return False
+    return any(w in hay for w in _STONE_WORDS)
 
 
 def _average_color(path):
@@ -600,6 +954,61 @@ def _average_color(path):
         col = None
     _AVG_COLOR_CACHE[path] = col
     return col
+
+
+def _build_normal_map(path, size: int = 256):
+    """Genera un normal-map (relieve) a partir de la luminancia de la textura.
+
+    Se calcula una vez por textura y se cachea. El resultado es una ``QImage``
+    RGBA8888 con la normal en (x, y, 1) mapeada a 0..255, o ``None`` si la
+    textura no se puede leer. Así las piedras/ladrillos ganan volumen sin que
+    el modelo tenga un mapa de normales propio."""
+    if path in _NORMAL_CACHE:
+        return _NORMAL_CACHE[path]
+    out = None
+    try:
+        from PySide6.QtGui import QImage
+        img = QImage(path)
+        if not img.isNull():
+            img = img.scaled(size, size, Qt.IgnoreAspectRatio,
+                             Qt.SmoothTransformation)
+            img = img.convertToFormat(QImage.Format_RGB32)
+            w, h = img.width(), img.height()
+            # Luminancia en una matriz de float.
+            lum = [[0.0] * w for _ in range(h)]
+            for y in range(h):
+                row = lum[y]
+                for x in range(w):
+                    c = img.pixel(x, y)
+                    row[x] = (((c >> 16) & 255) * 0.299
+                              + ((c >> 8) & 255) * 0.587
+                              + (c & 255) * 0.114) / 255.0
+            nm = QImage(w, h, QImage.Format_RGBA8888)
+            for y in range(h):
+                ym = (y - 1) % h
+                yp = (y + 1) % h
+                for x in range(w):
+                    xm = (x - 1) % w
+                    xp = (x + 1) % w
+                    # Sobel.
+                    gx = (lum[ym][xm] + 2.0 * lum[y][xm] + lum[yp][xm]) \
+                        - (lum[ym][xp] + 2.0 * lum[y][xp] + lum[yp][xp])
+                    gy = (lum[ym][xm] + 2.0 * lum[ym][x] + lum[ym][xp]) \
+                        - (lum[yp][xm] + 2.0 * lum[yp][x] + lum[yp][xp])
+                    # Normal = normalize(-gx * k, -gy * k, 1).
+                    k = 2.5
+                    nx, ny, nz = -gx * k, -gy * k, 1.0
+                    ln = math.sqrt(nx * nx + ny * ny + nz * nz) or 1.0
+                    nx, ny, nz = nx / ln, ny / ln, nz / ln
+                    r = int((nx * 0.5 + 0.5) * 255.0 + 0.5)
+                    g = int((ny * 0.5 + 0.5) * 255.0 + 0.5)
+                    b = int((nz * 0.5 + 0.5) * 255.0 + 0.5)
+                    nm.setPixel(x, y, (0xFF << 24) | (r << 16) | (g << 8) | b)
+            out = nm
+    except Exception:  # noqa: BLE001
+        out = None
+    _NORMAL_CACHE[path] = out
+    return out
 
 
 def _emit_blade(buf, root: QVector3D, nrm: QVector3D, tint, rng) -> None:
@@ -844,10 +1253,23 @@ def build_world_geometry(scene) -> WorldGeometry:
                 chosen = getattr(entry, "finish", None)
             finish = resolve_finish(chosen, matname, texpath, opacity)
             rough, metal, trans, _ior = PBR.get(finish, (0.9, 0.0, 0.0, 1.5))
-            key = (texpath, round(rough, 3), round(metal, 3),
-                   round(trans, 3), round(opacity, 3))
-            bucket = _bucket(key, texpath)
+            # Pisos pulidos: baja la rugosidad para que reflejen como glossy.
+            if _is_glossy(texpath, matname):
+                rough = min(rough, 0.12)
+                metal = max(metal, 0.10)
+            # Relieve: fuerza del normal-map derivado de la textura.
+            if _is_stone(texpath, matname):
+                bump = 0.9
+            elif texpath:
+                bump = 0.30
+            else:
+                bump = 0.0
             grass = _is_grass(texpath, matname)
+            if grass:
+                bump = 0.0        # el césped 3D ya da el detalle
+            key = (texpath, round(rough, 3), round(metal, 3),
+                   round(trans, 3), round(opacity, 3), round(bump, 2))
+            bucket = _bucket(key, texpath)
             glist = [] if grass else None
         except Exception:  # noqa: BLE001 — una cara mala no tira la escena
             continue
@@ -885,7 +1307,7 @@ def build_world_geometry(scene) -> WorldGeometry:
             continue
         buf.extend(bucket)
         n_floats = len(bucket)
-        run = _DrawRun(texture, key[1], key[2], key[3], key[4])
+        run = _DrawRun(texture, key[1], key[2], key[3], key[4], key[5])
         run.first = first
         run.count = n_floats // (V_STRIDE // 4)
         first += run.count
@@ -964,22 +1386,39 @@ class WorldView(QOpenGLWidget):
         self.setMouseTracking(True)
 
         self.camera = FlyCamera()
-        self._gl: QOpenGLFunctions | None = None
+        self._gl = None
+        self._mrt = False
         self._prog = None
         self._sky = None
         self._depth = None
         self._gprog = None
+        self._ssao = None
+        self._bright = None
+        self._blur = None
+        self._comp = None
         self._vao = None
         self._empty_vao = None
         self._vbo = None
         self._gvao = None
         self._gvbo = None
         self._shadow_fbo = None
+        self._scene_fbo = None
+        self._ao_fbo = None
+        self._bloom_a = None
+        self._bloom_b = None
+        self._white_tex = None
+        self._black_tex = None
+        self._fb_size = None
         self._textures: dict = {}
+        self._normals: dict = {}
         self._lm: dict = {}
         self._ls: dict = {}
         self._ld: dict = {}
         self._lg: dict = {}
+        self._lo: dict = {}
+        self._lb: dict = {}
+        self._lc: dict = {}
+        self._blocs: dict = {}
         self._runs: list[_DrawRun] = []
         self._vcount = 0
         self._gcount = 0
@@ -990,6 +1429,7 @@ class WorldView(QOpenGLWidget):
         self._bounds = None
         self._light_vp = QMatrix4x4()
         self._sun_dir = QVector3D(0.35, 0.45, 0.82)
+        self._scene_radius = 10.0
 
         self.shadows = True
         self.ambient = 0.55
@@ -998,6 +1438,16 @@ class WorldView(QOpenGLWidget):
         self.grass = True
         self.wind = True
         self.grass_density = 45.0
+        self.env = 0.40           # intensidad de reflejos de entorno
+        self.floor_gloss = 0.35   # pisos hacia arriba pulidos
+        self.bump = 1.0           # multiplicador global de relieve
+        self.ssr = True           # reflejos en pantalla
+        self.ssao = True          # oclusión ambiental
+        self.bloom = True         # resplandor solar
+        self.bloom_amount = 0.55
+        self.ao_strength = 0.55
+        self.sky_preset = 0
+        self.vignette = 0.30
         self._shadow_dirty = True
 
         self._keys: set = set()
@@ -1057,16 +1507,39 @@ class WorldView(QOpenGLWidget):
 
     # ---- GL ---------------------------------------------------------------
     def initializeGL(self) -> None:
-        self._gl = QOpenGLFunctions(self.context())
-        self._gl.initializeOpenGLFunctions()
+        self._gl = None
+        self._mrt = False
+        try:
+            prof = QOpenGLVersionProfile()
+            prof.setVersion(3, 3)
+            prof.setProfile(QSurfaceFormat.CoreProfile)
+            gl = QOpenGLVersionFunctionsFactory.get(prof, self.context())
+            if gl is not None:
+                gl.initializeOpenGLFunctions()
+                self._gl = gl
+                self._mrt = hasattr(gl, "glDrawBuffers")
+        except Exception:  # noqa: BLE001
+            log.exception("ViReal: no pude obtener las funciones GL 3.3")
+        if self._gl is None:
+            self._gl = QOpenGLFunctions(self.context())
+            self._gl.initializeOpenGLFunctions()
         self._prog = self._compile(_VERT, _FRAG, "principal")
         self._sky = self._compile(_SKY_VERT, _SKY_FRAG, "cielo")
         self._depth = self._compile(_DEPTH_VERT, _DEPTH_FRAG, "sombras")
         self._gprog = self._compile(_GRASS_VERT, _GRASS_FRAG, "césped")
+        self._ssao = self._compile(_FS_VERT, _SSAO_FRAG, "ssao")
+        self._bright = self._compile(_FS_VERT, _BRIGHT_FRAG, "bloom-brillo")
+        self._blur = self._compile(_FS_VERT, _BLUR_FRAG, "bloom-desenfoque")
+        self._comp = self._compile(_FS_VERT, _COMPOSITE_FRAG, "compuesto")
         self._lm = self._locs_for(self._prog, _MAIN_UNIFORMS) if self._prog else {}
         self._ls = self._locs_for(self._sky, _SKY_UNIFORMS) if self._sky else {}
         self._ld = self._locs_for(self._depth, _DEPTH_UNIFORMS) if self._depth else {}
         self._lg = self._locs_for(self._gprog, _GRASS_UNIFORMS) if self._gprog else {}
+        self._lo = self._locs_for(self._ssao, _SSAO_UNIFORMS) if self._ssao else {}
+        self._lb = self._locs_for(self._bright, _BRIGHT_UNIFORMS) if self._bright else {}
+        self._lc = self._locs_for(self._comp, _COMPOSITE_UNIFORMS) if self._comp else {}
+        self._blocs = self._locs_for(self._blur, _BLUR_UNIFORMS) \
+            if self._blur else {}
         self._vao = QOpenGLVertexArrayObject(self)
         self._vao.create()
         self._empty_vao = QOpenGLVertexArrayObject(self)
@@ -1162,6 +1635,8 @@ class WorldView(QOpenGLWidget):
             return
         geo = build_world_geometry(scene)
         self._bounds = geo.bounds
+        if geo.bounds is not None:
+            self._scene_radius = max(2.0, (geo.bounds[1] - geo.bounds[0]).length() * 0.5)
         self._runs = geo.runs
         raw = geo.data
         self._vcount = geo.tris
@@ -1324,6 +1799,148 @@ class WorldView(QOpenGLWidget):
         self._textures[path] = tex
         return tex
 
+    def _get_normal(self, path: str):
+        """Textura de relieve (normal-map) derivada de la textura difusa."""
+        if path in self._normals:
+            return self._normals[path]
+        tex = None
+        img = _build_normal_map(path)
+        if img is not None:
+            try:
+                tex = QOpenGLTexture(img.mirrored())
+                tex.setWrapMode(QOpenGLTexture.Repeat)
+                tex.setMinificationFilter(QOpenGLTexture.LinearMipMapLinear)
+                tex.setMagnificationFilter(QOpenGLTexture.Linear)
+            except Exception:  # noqa: BLE001
+                tex = None
+        self._normals[path] = tex
+        return tex
+
+    def _solid_tex(self, value: int):
+        """Textura 1×1 constante (blanca/negra) para pasar por sampler."""
+        from PySide6.QtGui import QImage
+        img = QImage(1, 1, QImage.Format_RGBA8888)
+        img.fill(value)
+        tex = QOpenGLTexture(img)
+        tex.setMinificationFilter(QOpenGLTexture.Linear)
+        tex.setMagnificationFilter(QOpenGLTexture.Linear)
+        return tex
+
+    def _white(self):
+        if self._white_tex is None:
+            self._white_tex = self._solid_tex(0xFFFFFFFF)
+        return self._white_tex
+
+    def _black(self):
+        if self._black_tex is None:
+            self._black_tex = self._solid_tex(0xFF000000)
+        return self._black_tex
+
+    # ---- infraestructura GL ----------------------------------------------
+    def _dpr(self) -> float:
+        try:
+            return max(1.0, min(2.0, float(self.devicePixelRatioF())))
+        except Exception:  # noqa: BLE001
+            return 1.0
+
+    @staticmethod
+    def _invert(m: QMatrix4x4) -> QMatrix4x4:
+        try:
+            res = m.inverted()
+            if isinstance(res, tuple):
+                return res[0] if res[1] else QMatrix4x4()
+            return res
+        except Exception:  # noqa: BLE001
+            return QMatrix4x4()
+
+    def _draw_buffers(self, bufs) -> None:
+        if self._mrt:
+            try:
+                self._gl.glDrawBuffers(len(bufs), list(bufs))
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _bind_tex(self, unit: int, gl_id: int) -> None:
+        gl = self._gl
+        gl.glActiveTexture(GL_TEXTURE0 + unit)
+        gl.glBindTexture(GL_TEXTURE_2D, int(gl_id))
+        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        gl.glActiveTexture(GL_TEXTURE0)
+
+    def _ensure_scene_fbo(self, w: int, h: int):
+        if self._scene_fbo is not None and self._fb_size == (w, h):
+            return self._scene_fbo
+        self._delete_targets()
+        try:
+            fmt = QOpenGLFramebufferObjectFormat()
+            fmt.setAttachment(QOpenGLFramebufferObject.Depth)
+            fmt.setInternalTextureFormat(GL_RGBA16F)
+            fbo = QOpenGLFramebufferObject(w, h, fmt)
+            if not fbo.isValid():
+                self._error = "FBO de escena no válido"
+                return None
+            if self._mrt:
+                fbo.addColorAttachment(w, h)
+                fbo.addColorAttachment(w, h)
+            self._scene_fbo = fbo
+            self._fb_size = (w, h)
+        except Exception as ex:  # noqa: BLE001
+            log.exception("ViReal: no pude crear el FBO de escena")
+            self._error = f"escena: {ex}"
+            self._scene_fbo = None
+            return None
+        # auxiliares (AO y bloom)
+        try:
+            afmt = QOpenGLFramebufferObjectFormat()
+            afmt.setAttachment(QOpenGLFramebufferObject.NoAttachment)
+            self._ao_fbo = QOpenGLFramebufferObject(w, h, afmt)
+            hw, hh = max(1, w // 2), max(1, h // 2)
+            bfmt = QOpenGLFramebufferObjectFormat()
+            bfmt.setAttachment(QOpenGLFramebufferObject.NoAttachment)
+            bfmt.setInternalTextureFormat(GL_RGBA16F)
+            self._bloom_a = QOpenGLFramebufferObject(hw, hh, bfmt)
+            self._bloom_b = QOpenGLFramebufferObject(hw, hh, bfmt)
+        except Exception:  # noqa: BLE001
+            log.exception("ViReal: no pude crear los FBO auxiliares")
+        return self._scene_fbo
+
+    def _delete_targets(self) -> None:
+        for name in ("_scene_fbo", "_ao_fbo", "_bloom_a", "_bloom_b"):
+            obj = getattr(self, name, None)
+            if obj is not None:
+                try:
+                    del obj
+                except Exception:  # noqa: BLE001
+                    pass
+                setattr(self, name, None)
+        self._fb_size = None
+
+    # ---- pasadas de render -------------------------------------------------
+    def _render_shadow(self) -> int:
+        gl = self._gl
+        if not (self.shadows and self._depth is not None and self._vcount):
+            return 0
+        fbo = self._ensure_shadow_fbo()
+        if fbo is None:
+            return 0
+        if self._shadow_dirty:
+            fbo.bind()
+            gl.glViewport(0, 0, SHADOW_SIZE, SHADOW_SIZE)
+            gl.glClearColor(1.0, 1.0, 1.0, 1.0)
+            gl.glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+            self._depth.bind()
+            self._sv(self._depth, self._ld, "u_light_vp", self._light_vp)
+            self._vao.bind()
+            gl.glDrawArrays(GL_TRIANGLES, 0, self._vcount)
+            self._vao.release()
+            self._depth.release()
+            fbo.release()
+            self._shadow_dirty = False
+        return fbo.texture()
+
     # ---- pintado ----------------------------------------------------------
     def paintGL(self) -> None:
         if self._gl is None:
@@ -1332,179 +1949,290 @@ class WorldView(QOpenGLWidget):
             self._rebuild()
 
         gl = self._gl
-        w = max(1, self.width())
-        h = max(1, self.height())
+        dpr = self._dpr()
+        w = max(1, int(self.width() * dpr))
+        h = max(1, int(self.height() * dpr))
         aspect = w / h
 
         view = self.camera.view_matrix()
         proj = self.camera.projection_matrix(aspect)
         mvp = proj * view
 
-        sky_col, gnd_col, sun_col, reflect = self._palette()
+        sky_col, gnd_col, sun_col, _reflect = self._palette()
 
-        # --- mapa de sombras (solo se rehace si cambió la escena: la matriz
-        # de luz no depende de la cámara) ---
-        shadow_tex = 0
-        if self.shadows and self._depth is not None and self._vcount:
-            fbo = self._ensure_shadow_fbo()
-            if fbo is not None:
-                if self._shadow_dirty:
-                    fbo.bind()
-                    gl.glViewport(0, 0, SHADOW_SIZE, SHADOW_SIZE)
-                    gl.glClearColor(1.0, 1.0, 1.0, 1.0)
-                    gl.glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-                    self._depth.bind()
-                    self._sv(self._depth, self._ld, "u_light_vp", self._light_vp)
-                    self._vao.bind()
-                    gl.glDrawArrays(GL_TRIANGLES, 0, self._vcount)
-                    self._vao.release()
-                    self._depth.release()
-                    fbo.release()
-                    self._shadow_dirty = False
-                shadow_tex = fbo.texture()
+        shadow_tex = self._render_shadow()
 
-        # --- frame por defecto del widget ---
-        gl.glBindFramebuffer(0x8D40, self.defaultFramebufferObject())
-        gl.glViewport(0, 0, int(w * self.devicePixelRatioF()),
-                      int(h * self.devicePixelRatioF()))
-        gl.glClearColor(sky_col.x(), sky_col.y(), sky_col.z(), 1.0)
+        fbo = self._ensure_scene_fbo(w, h)
+        if fbo is None:
+            return
+        texs = fbo.textures()
+
+        use_shadow = 1 if shadow_tex else 0
+
+        # --- pasada de escena (HDR, MRT) ---
+        fbo.bind()
+        if self._mrt and len(texs) >= 3:
+            self._draw_buffers((GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1,
+                                GL_COLOR_ATTACHMENT2))
+        gl.glViewport(0, 0, w, h)
+        gl.glClearColor(0.0, 0.0, 0.0, 0.0)
         gl.glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
-        # --- cielo ---
-        if self._sky is not None:
-            self._sky.bind()
-            inv = QMatrix4x4()
-            try:
-                res = mvp.inverted()
-                if isinstance(res, tuple):
-                    if res[1]:
-                        inv = res[0]
-                else:
-                    inv = res
-            except Exception:  # noqa: BLE001
-                inv = QMatrix4x4()
-            self._sv(self._sky, self._ls, "u_inv_vp", inv)
-            self._sv(self._sky, self._ls, "u_cam", self.camera.pos)
-            self._sv(self._sky, self._ls, "u_sun_dir", self._sun_dir)
-            self._sv(self._sky, self._ls, "u_sun_col", sun_col)
-            self._sv(self._sky, self._ls, "u_sky_col", sky_col)
-            self._sv(self._sky, self._ls, "u_gnd_col", gnd_col)
-            self._sv(self._sky, self._ls, "u_exposure", self.exposure)
-            self._empty_vao.bind()
-            self._gl.glDisable(GL_DEPTH_TEST)
-            gl.glDrawArrays(GL_TRIANGLES, 0, 3)
-            self._gl.glEnable(GL_DEPTH_TEST)
-            self._empty_vao.release()
-            self._sky.release()
+        self._draw_sky(mvp, sky_col, gnd_col, sun_col)
+        self._draw_world(mvp, sky_col, gnd_col, sun_col, shadow_tex, use_shadow)
+        self._draw_grass(mvp, sky_col, gnd_col, sun_col, shadow_tex, use_shadow)
+        fbo.release()
 
-        # --- geometría ---
-        if self._runs and self._prog is not None:
-            self._prog.bind()
-            self._sv(self._prog, self._lm, "u_mvp", mvp)
-            self._sv(self._prog, self._lm, "u_cam", self.camera.pos)
-            self._sv(self._prog, self._lm, "u_sun_dir", self._sun_dir)
-            self._sv(self._prog, self._lm, "u_sun_col", sun_col)
-            self._sv(self._prog, self._lm, "u_sky_col", sky_col)
-            self._sv(self._prog, self._lm, "u_gnd_col", gnd_col)
-            self._sv(self._prog, self._lm, "u_ambient", self.ambient)
-            self._sv(self._prog, self._lm, "u_exposure", self.exposure)
-            self._sv(self._prog, self._lm, "u_shadow_strength",
-                     self.shadow_strength)
-            self._sv(self._prog, self._lm, "u_light_vp", self._light_vp)
-            self._sv(self._prog, self._lm, "u_reflect", reflect)
-            use_shadow = 1 if (self.shadows and shadow_tex) else 0
-            self._sv(self._prog, self._lm, "u_shadow_enable", use_shadow)
-            self._sv(self._prog, self._lm, "u_shadow", 1)
-            self._sv(self._prog, self._lm, "u_tex", 0)
+        # --- SSAO ---
+        ao_tex = self._render_ao(w, h, view, proj, texs)
 
-            if shadow_tex:
-                gl.glActiveTexture(GL_TEXTURE1)
-                gl.glBindTexture(GL_TEXTURE_2D, int(shadow_tex))
-                # El FBO no trae mipmaps: sin fijar el filtro la textura queda
-                # incompleta y muestrea negro (sombras inertes).
-                gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
-                gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-                gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-                                   GL_CLAMP_TO_EDGE)
-                gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-                                   GL_CLAMP_TO_EDGE)
-                gl.glActiveTexture(GL_TEXTURE0)
+        # --- bloom ---
+        bloom_tex = self._render_bloom(texs)
 
-            self._vao.bind()
-            for run in self._runs:
-                self._sv(self._prog, self._lm, "u_color",
-                         QVector3D(1.0, 1.0, 1.0))
-                self._sv(self._prog, self._lm, "u_opacity", run.opacity)
-                if run.texture:
-                    tex = self._get_texture(run.texture)
-                    if tex is not None:
-                        self._sv(self._prog, self._lm, "u_use_texture", 1)
-                        tex.bind(0)
-                    else:
-                        self._sv(self._prog, self._lm, "u_use_texture", 0)
-                else:
-                    self._sv(self._prog, self._lm, "u_use_texture", 0)
-                if run.opacity < 0.999:
-                    gl.glEnable(GL_BLEND)
-                    gl.glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-                    gl.glDepthMask(False)
-                gl.glDrawArrays(GL_TRIANGLES, run.first, run.count)
-                if run.opacity < 0.999:
-                    gl.glDepthMask(True)
-                    gl.glDisable(GL_BLEND)
-            self._vao.release()
-            self._prog.release()
-
-        # --- césped 3D (opaco, recibe sombras) ---
-        if self.grass and self._gcount and self._gprog is not None:
-            gprog = self._gprog
-            gprog.bind()
-            self._sv(gprog, self._lg, "u_mvp", mvp)
-            self._sv(gprog, self._lg, "u_cam", self.camera.pos)
-            self._sv(gprog, self._lg, "u_sun_dir", self._sun_dir)
-            self._sv(gprog, self._lg, "u_sun_col", sun_col)
-            self._sv(gprog, self._lg, "u_sky_col", sky_col)
-            self._sv(gprog, self._lg, "u_gnd_col", gnd_col)
-            self._sv(gprog, self._lg, "u_ambient", self.ambient)
-            self._sv(gprog, self._lg, "u_exposure", self.exposure)
-            self._sv(gprog, self._lg, "u_shadow_strength", self.shadow_strength)
-            self._sv(gprog, self._lg, "u_light_vp", self._light_vp)
-            use_shadow = 1 if (self.shadows and shadow_tex) else 0
-            self._sv(gprog, self._lg, "u_shadow_enable", use_shadow)
-            self._sv(gprog, self._lg, "u_shadow", 1)
-            self._sv(gprog, self._lg, "u_time",
-                     self._time if self.wind else 0.0)
-            wdx, wdy = WIND_DIR
-            self._sv(gprog, self._lg, "u_wind_dir", QVector2D(wdx, wdy))
-            self._sv(gprog, self._lg, "u_wind_strength",
-                     WIND_STRENGTH if self.wind else 0.0)
-            if shadow_tex:
-                gl.glActiveTexture(GL_TEXTURE1)
-                gl.glBindTexture(GL_TEXTURE_2D, int(shadow_tex))
-                gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
-                gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-                gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-                                   GL_CLAMP_TO_EDGE)
-                gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-                                   GL_CLAMP_TO_EDGE)
-                gl.glActiveTexture(GL_TEXTURE0)
-            self._gvao.bind()
-            gl.glDrawArrays(GL_TRIANGLES, 0, self._gcount)
-            self._gvao.release()
-            gprog.release()
+        # --- composición final al widget ---
+        self._composite(w, h, view, proj, texs, ao_tex, bloom_tex,
+                        sky_col, gnd_col, sun_col)
 
         self._draw_hud(w, h)
 
+    def _draw_sky(self, mvp, sky_col, gnd_col, sun_col) -> None:
+        if self._sky is None:
+            return
+        gl = self._gl
+        self._sky.bind()
+        self._sv(self._sky, self._ls, "u_inv_vp", self._invert(mvp))
+        self._sv(self._sky, self._ls, "u_cam", self.camera.pos)
+        self._sv(self._sky, self._ls, "u_sun_dir", self._sun_dir)
+        self._sv(self._sky, self._ls, "u_sun_col", sun_col)
+        self._sv(self._sky, self._ls, "u_sky_col", sky_col)
+        self._sv(self._sky, self._ls, "u_gnd_col", gnd_col)
+        self._empty_vao.bind()
+        gl.glDisable(GL_DEPTH_TEST)
+        gl.glDrawArrays(GL_TRIANGLES, 0, 3)
+        gl.glEnable(GL_DEPTH_TEST)
+        self._empty_vao.release()
+        self._sky.release()
+
+    def _draw_world(self, mvp, sky_col, gnd_col, sun_col, shadow_tex,
+                    use_shadow) -> None:
+        if not self._runs or self._prog is None:
+            return
+        gl = self._gl
+        self._prog.bind()
+        self._sv(self._prog, self._lm, "u_mvp", mvp)
+        self._sv(self._prog, self._lm, "u_cam", self.camera.pos)
+        self._sv(self._prog, self._lm, "u_sun_dir", self._sun_dir)
+        self._sv(self._prog, self._lm, "u_sun_col", sun_col)
+        self._sv(self._prog, self._lm, "u_sky_col", sky_col)
+        self._sv(self._prog, self._lm, "u_gnd_col", gnd_col)
+        self._sv(self._prog, self._lm, "u_ambient", self.ambient)
+        self._sv(self._prog, self._lm, "u_env", self.env)
+        self._sv(self._prog, self._lm, "u_floor_gloss", self.floor_gloss)
+        self._sv(self._prog, self._lm, "u_shadow_strength", self.shadow_strength)
+        self._sv(self._prog, self._lm, "u_light_vp", self._light_vp)
+        self._sv(self._prog, self._lm, "u_shadow_enable", use_shadow)
+        self._sv(self._prog, self._lm, "u_shadow", 1)
+        self._sv(self._prog, self._lm, "u_tex", 0)
+        self._sv(self._prog, self._lm, "u_bump", 2)
+        if shadow_tex:
+            self._bind_tex(1, shadow_tex)
+
+        self._vao.bind()
+        for run in self._runs:
+            self._sv(self._prog, self._lm, "u_color", QVector3D(1.0, 1.0, 1.0))
+            self._sv(self._prog, self._lm, "u_opacity", run.opacity)
+            if run.texture:
+                tex = self._get_texture(run.texture)
+                if tex is not None:
+                    self._sv(self._prog, self._lm, "u_use_texture", 1)
+                    tex.bind(0)
+                else:
+                    self._sv(self._prog, self._lm, "u_use_texture", 0)
+            else:
+                self._sv(self._prog, self._lm, "u_use_texture", 0)
+            # relieve
+            bstr = run.bump * self.bump
+            if bstr > 0.001 and run.texture:
+                nrm = self._get_normal(run.texture)
+                if nrm is not None:
+                    self._sv(self._prog, self._lm, "u_use_bump", 1)
+                    self._sv(self._prog, self._lm, "u_bump_strength", bstr)
+                    nrm.bind(2)
+                else:
+                    self._sv(self._prog, self._lm, "u_use_bump", 0)
+            else:
+                self._sv(self._prog, self._lm, "u_use_bump", 0)
+            if run.opacity < 0.999:
+                gl.glEnable(GL_BLEND)
+                gl.glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+                gl.glDepthMask(False)
+            gl.glDrawArrays(GL_TRIANGLES, run.first, run.count)
+            if run.opacity < 0.999:
+                gl.glDepthMask(True)
+                gl.glDisable(GL_BLEND)
+        self._vao.release()
+        self._prog.release()
+
+    def _draw_grass(self, mvp, sky_col, gnd_col, sun_col, shadow_tex,
+                    use_shadow) -> None:
+        if not (self.grass and self._gcount and self._gprog is not None):
+            return
+        gl = self._gl
+        gprog = self._gprog
+        gprog.bind()
+        self._sv(gprog, self._lg, "u_mvp", mvp)
+        self._sv(gprog, self._lg, "u_cam", self.camera.pos)
+        self._sv(gprog, self._lg, "u_sun_dir", self._sun_dir)
+        self._sv(gprog, self._lg, "u_sun_col", sun_col)
+        self._sv(gprog, self._lg, "u_sky_col", sky_col)
+        self._sv(gprog, self._lg, "u_gnd_col", gnd_col)
+        self._sv(gprog, self._lg, "u_ambient", self.ambient)
+        self._sv(gprog, self._lg, "u_shadow_strength", self.shadow_strength)
+        self._sv(gprog, self._lg, "u_light_vp", self._light_vp)
+        self._sv(gprog, self._lg, "u_shadow_enable", use_shadow)
+        self._sv(gprog, self._lg, "u_shadow", 1)
+        self._sv(gprog, self._lg, "u_time",
+                 self._time if self.wind else 0.0)
+        wdx, wdy = WIND_DIR
+        self._sv(gprog, self._lg, "u_wind_dir", QVector2D(wdx, wdy))
+        self._sv(gprog, self._lg, "u_wind_strength",
+                 WIND_STRENGTH if self.wind else 0.0)
+        if shadow_tex:
+            self._bind_tex(1, shadow_tex)
+        self._gvao.bind()
+        gl.glDrawArrays(GL_TRIANGLES, 0, self._gcount)
+        self._gvao.release()
+        gprog.release()
+
+    def _render_ao(self, w, h, view, proj, texs):
+        """Sombra ambiental (SSAO). Devuelve el id de textura con el AO."""
+        gl = self._gl
+        if not (self.ssao and self._mrt and self._ssao is not None
+                and self._ao_fbo is not None and len(texs) >= 3):
+            return 0
+        ao = self._ao_fbo
+        ao.bind()
+        self._draw_buffers((GL_COLOR_ATTACHMENT0,))
+        gl.glViewport(0, 0, w, h)
+        gl.glDisable(GL_DEPTH_TEST)
+        prog = self._ssao
+        prog.bind()
+        self._bind_tex(0, texs[2])   # posición mundo
+        self._bind_tex(1, texs[1])   # normal
+        self._sv(prog, self._lo, "u_pos", 0)
+        self._sv(prog, self._lo, "u_mat", 1)
+        self._sv(prog, self._lo, "u_view", view)
+        self._sv(prog, self._lo, "u_proj", proj)
+        self._sv(prog, self._lo, "u_texel", QVector2D(1.0 / w, 1.0 / h))
+        self._sv(prog, self._lo, "u_radius",
+                 max(0.08, self._scene_radius * 0.012))
+        self._sv(prog, self._lo, "u_bias", 0.02)
+        self._sv(prog, self._lo, "u_intensity", 1.2)
+        self._empty_vao.bind()
+        gl.glDrawArrays(GL_TRIANGLES, 0, 3)
+        self._empty_vao.release()
+        prog.release()
+        gl.glEnable(GL_DEPTH_TEST)
+        ao.release()
+        return ao.texture()
+
+    def _render_bloom(self, texs):
+        gl = self._gl
+        if not (self.bloom and self._bright is not None and self._blur is not None
+                and self._bloom_a is not None and self._bloom_b is not None):
+            return 0
+        a, b = self._bloom_a, self._bloom_b
+        bw, bh = a.width(), a.height()
+        gl.glDisable(GL_DEPTH_TEST)
+        self._empty_vao.bind()
+        # brillo
+        a.bind()
+        self._draw_buffers((GL_COLOR_ATTACHMENT0,))
+        gl.glViewport(0, 0, bw, bh)
+        self._bright.bind()
+        self._bind_tex(0, texs[0])
+        self._sv(self._bright, self._lb, "u_tex", 0)
+        self._sv(self._bright, self._lb, "u_threshold", 1.05)
+        self._sv(self._bright, self._lb, "u_knee", 0.6)
+        gl.glDrawArrays(GL_TRIANGLES, 0, 3)
+        self._bright.release()
+        # desenfoque horizontal y vertical (2 pasadas)
+        for src, dst, direction in ((a, b, (1.0, 0.0)), (b, a, (0.0, 1.0)),
+                                    (a, b, (1.0, 0.0)), (b, a, (0.0, 1.0))):
+            dst.bind()
+            self._draw_buffers((GL_COLOR_ATTACHMENT0,))
+            gl.glViewport(0, 0, bw, bh)
+            self._blur.bind()
+            self._bind_tex(0, src.texture())
+            self._sv(self._blur, self._blocs, "u_tex", 0)
+            self._sv(self._blur, self._blocs, "u_dir",
+                     QVector2D(direction[0] / bw, direction[1] / bh))
+            self._sv(self._blur, self._blocs, "u_texel",
+                     QVector2D(1.0 / bw, 1.0 / bh))
+            gl.glDrawArrays(GL_TRIANGLES, 0, 3)
+            self._blur.release()
+        self._empty_vao.release()
+        gl.glEnable(GL_DEPTH_TEST)
+        return a.texture()
+
+    def _composite(self, w, h, view, proj, texs, ao_tex, bloom_tex,
+                   sky_col, gnd_col, sun_col) -> None:
+        gl = self._gl
+        if self._comp is None:
+            return
+        gl.glBindFramebuffer(GL_FRAMEBUFFER, self.defaultFramebufferObject())
+        gl.glDisable(GL_DEPTH_TEST)
+        gl.glViewport(0, 0, w, h)
+        prog = self._comp
+        prog.bind()
+        self._bind_tex(0, texs[0])
+        self._bind_tex(1, ao_tex if ao_tex else self._white().textureId())
+        self._bind_tex(2, bloom_tex if bloom_tex else self._black().textureId())
+        if self._mrt and len(texs) >= 3:
+            self._bind_tex(3, texs[2])
+            self._bind_tex(4, texs[1])
+        else:
+            self._bind_tex(3, self._black().textureId())
+            self._bind_tex(4, self._black().textureId())
+        self._sv(prog, self._lc, "u_color", 0)
+        self._sv(prog, self._lc, "u_ao", 1)
+        self._sv(prog, self._lc, "u_bloom", 2)
+        self._sv(prog, self._lc, "u_pos", 3)
+        self._sv(prog, self._lc, "u_mat", 4)
+        self._sv(prog, self._lc, "u_cam", self.camera.pos)
+        self._sv(prog, self._lc, "u_sun_dir", self._sun_dir)
+        self._sv(prog, self._lc, "u_sun_col", sun_col)
+        self._sv(prog, self._lc, "u_sky_col", sky_col)
+        self._sv(prog, self._lc, "u_gnd_col", gnd_col)
+        self._sv(prog, self._lc, "u_view", view)
+        self._sv(prog, self._lc, "u_proj", proj)
+        self._sv(prog, self._lc, "u_exposure", self.exposure)
+        self._sv(prog, self._lc, "u_ao_strength",
+                 self.ao_strength if (self.ssao and ao_tex) else 0.0)
+        self._sv(prog, self._lc, "u_bloom_amount",
+                 self.bloom_amount if (self.bloom and bloom_tex) else 0.0)
+        self._sv(prog, self._lc, "u_env", self.env)
+        self._sv(prog, self._lc, "u_ssr_enable",
+                 1 if (self.ssr and self._mrt and len(texs) >= 3) else 0)
+        self._sv(prog, self._lc, "u_ssr_strength", 0.85)
+        self._sv(prog, self._lc, "u_vignette", self.vignette)
+        self._empty_vao.bind()
+        gl.glDrawArrays(GL_TRIANGLES, 0, 3)
+        self._empty_vao.release()
+        prog.release()
+        gl.glEnable(GL_DEPTH_TEST)
+
     def _palette(self):
-        # Cielo fotográfico propio (no el fondo gris del CAD): el «ViReal»
-        # quiere un horizonte azul, no el papel del viewport.
-        sky = QVector3D(0.46, 0.64, 0.92)
-        gnd = QVector3D(0.30, 0.29, 0.27)
-        sun = QVector3D(1.00, 0.96, 0.88)
-        # El sol bajo tiñe más cálido.
+        # Cielo fotográfico propio (no el fondo gris del CAD). La paleta base
+        # la fija el usuario; el sol se tiñe con la elevación real.
+        idx = max(0, min(len(_SKY_PRESETS) - 1, int(self.sky_preset)))
+        _name, sky_rgb, gnd_rgb, sun_rgb = _SKY_PRESETS[idx]
+        sky = QVector3D(*sky_rgb)
+        gnd = QVector3D(*gnd_rgb)
+        sun = QVector3D(*sun_rgb)
         elev = max(0.0, self._sun_dir.z())
         warm = 1.0 - min(1.0, elev * 1.6)
-        sun = _lerp3(sun, QVector3D(1.0, 0.62, 0.34), warm * 0.8)
+        sun = _lerp3(sun, QVector3D(1.0, 0.62, 0.34), warm * 0.8 * min(1.0, idx + 1))
         reflect = _lerp3(sky, QVector3D(1.0, 1.0, 1.0), 0.25)
         return sky, gnd, sun, reflect
 
@@ -1518,8 +2246,9 @@ class WorldView(QOpenGLWidget):
             lines = [
                 "ViReal — ratón: mirar (arrastra) · W/A/S/D: mover · "
                 "Q/E: bajar/subir · rueda: acercar",
-                "Shift: correr · R: reencuadrar · T: sombras · "
-                "C: césped · V: viento",
+                "Shift: correr · R: reencuadrar",
+                "T: sombras · C: césped · V: viento · F: reflejos · "
+                "G: oclusión · B: bloom · N: cielo",
             ]
             if self._stats:
                 lines.append(self._stats)
@@ -1562,6 +2291,22 @@ class WorldView(QOpenGLWidget):
             return
         if k == Qt.Key_V:
             self.wind = not self.wind
+            self.update()
+            return
+        if k == Qt.Key_F:
+            self.ssr = not self.ssr
+            self.update()
+            return
+        if k == Qt.Key_G:
+            self.ssao = not self.ssao
+            self.update()
+            return
+        if k == Qt.Key_B:
+            self.bloom = not self.bloom
+            self.update()
+            return
+        if k == Qt.Key_N:
+            self.sky_preset = (self.sky_preset + 1) % len(_SKY_PRESETS)
             self.update()
             return
         self._keys.add(k)
@@ -1629,23 +2374,29 @@ class WorldWindow(QDialog):
 
     def _build_bar(self, app) -> QWidget:
         bar = QWidget(self)
-        lay = QHBoxLayout(bar)
-        lay.setContentsMargins(8, 6, 8, 6)
+        outer = QVBoxLayout(bar)
+        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(4)
+
+        # ---- fila 1: escena ----
+        row1 = QWidget(bar)
+        lay = QHBoxLayout(row1)
+        lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
 
-        btn_refresh = QPushButton("⟳  Actualizar", bar)
+        btn_refresh = QPushButton("⟳  Actualizar", row1)
         btn_refresh.clicked.connect(self.view.mark_dirty)
-        btn_frame = QPushButton("⛶  Reencuadrar", bar)
+        btn_frame = QPushButton("⛶  Reencuadrar", row1)
         btn_frame.clicked.connect(self.view.frame_scene)
         lay.addWidget(btn_refresh)
         lay.addWidget(btn_frame)
 
-        self.chk_shadows = QCheckBox("Sombras", bar)
+        self.chk_shadows = QCheckBox("Sombras", row1)
         self.chk_shadows.setChecked(True)
         self.chk_shadows.toggled.connect(self._on_shadows)
         lay.addWidget(self.chk_shadows)
 
-        self.chk_grass = QCheckBox("Césped 3D", bar)
+        self.chk_grass = QCheckBox("Césped 3D", row1)
         self.chk_grass.setChecked(True)
         self.chk_grass.setToolTip(
             "Hojas 3D que se mecen con el viento sobre las superficies con "
@@ -1653,14 +2404,14 @@ class WorldWindow(QDialog):
         self.chk_grass.toggled.connect(self._on_grass)
         lay.addWidget(self.chk_grass)
 
-        self.chk_wind = QCheckBox("Viento", bar)
+        self.chk_wind = QCheckBox("Viento", row1)
         self.chk_wind.setChecked(True)
         self.chk_wind.setToolTip("Anima el césped (tecla V)")
         self.chk_wind.toggled.connect(self._on_wind)
         lay.addWidget(self.chk_wind)
 
-        lay.addWidget(QLabel("Exposición", bar))
-        self.spin_exp = QDoubleSpinBox(bar)
+        lay.addWidget(QLabel("Exposición", row1))
+        self.spin_exp = QDoubleSpinBox(row1)
         self.spin_exp.setRange(0.2, 3.0)
         self.spin_exp.setSingleStep(0.05)
         self.spin_exp.setDecimals(2)
@@ -1668,8 +2419,8 @@ class WorldWindow(QDialog):
         self.spin_exp.valueChanged.connect(self._on_exposure)
         lay.addWidget(self.spin_exp)
 
-        lay.addWidget(QLabel("Ambiente", bar))
-        self.spin_amb = QDoubleSpinBox(bar)
+        lay.addWidget(QLabel("Ambiente", row1))
+        self.spin_amb = QDoubleSpinBox(row1)
         self.spin_amb.setRange(0.0, 2.0)
         self.spin_amb.setSingleStep(0.05)
         self.spin_amb.setDecimals(2)
@@ -1677,8 +2428,79 @@ class WorldWindow(QDialog):
         self.spin_amb.valueChanged.connect(self._on_ambient)
         lay.addWidget(self.spin_amb)
 
-        lay.addWidget(QLabel("Césped/m²", bar))
-        self.spin_grass = QDoubleSpinBox(bar)
+        lay.addStretch(1)
+        hint = QLabel("arrastra para mirar · W/A/S/D mover · Esc cerrar", row1)
+        hint.setEnabled(False)
+        lay.addWidget(hint)
+        outer.addWidget(row1)
+
+        # ---- fila 2: efectos ----
+        row2 = QWidget(bar)
+        fx = QHBoxLayout(row2)
+        fx.setContentsMargins(0, 0, 0, 0)
+        fx.setSpacing(8)
+
+        self.chk_ssr = QCheckBox("Reflejos", row2)
+        self.chk_ssr.setChecked(True)
+        self.chk_ssr.setToolTip("Reflejos en tiempo real sobre pisos glossy, "
+                                "vidrio y metal (tecla F)")
+        self.chk_ssr.toggled.connect(self._on_ssr)
+        fx.addWidget(self.chk_ssr)
+
+        self.chk_ssao = QCheckBox("Oclusión", row2)
+        self.chk_ssao.setChecked(True)
+        self.chk_ssao.setToolTip("Sombra ambiental: asienta los objetos sobre "
+                                 "el suelo (tecla G)")
+        self.chk_ssao.toggled.connect(self._on_ssao)
+        fx.addWidget(self.chk_ssao)
+
+        self.chk_bloom = QCheckBox("Bloom", row2)
+        self.chk_bloom.setChecked(True)
+        self.chk_bloom.setToolTip("Resplandor solar (tecla B)")
+        self.chk_bloom.toggled.connect(self._on_bloom)
+        fx.addWidget(self.chk_bloom)
+
+        fx.addWidget(QLabel("Cielo", row2))
+        self.cmb_sky = QComboBox(row2)
+        for name, _s, _g, _sn in _SKY_PRESETS:
+            self.cmb_sky.addItem(name)
+        self.cmb_sky.currentIndexChanged.connect(self._on_sky)
+        fx.addWidget(self.cmb_sky)
+
+        fx.addWidget(QLabel("Reflejo", row2))
+        self.spin_env = QDoubleSpinBox(row2)
+        self.spin_env.setRange(0.0, 1.5)
+        self.spin_env.setSingleStep(0.05)
+        self.spin_env.setDecimals(2)
+        self.spin_env.setValue(0.40)
+        self.spin_env.setToolTip("Intensidad de los reflejos del entorno")
+        self.spin_env.valueChanged.connect(self._on_env)
+        fx.addWidget(self.spin_env)
+
+        fx.addWidget(QLabel("Brillo pisos", row2))
+        self.spin_floor = QDoubleSpinBox(row2)
+        self.spin_floor.setRange(0.0, 1.0)
+        self.spin_floor.setSingleStep(0.05)
+        self.spin_floor.setDecimals(2)
+        self.spin_floor.setValue(0.35)
+        self.spin_floor.setToolTip("Vuelve glossy las caras que miran hacia "
+                                   "arriba (pisos)")
+        self.spin_floor.valueChanged.connect(self._on_floor)
+        fx.addWidget(self.spin_floor)
+
+        fx.addWidget(QLabel("Relieve", row2))
+        self.spin_bump = QDoubleSpinBox(row2)
+        self.spin_bump.setRange(0.0, 2.0)
+        self.spin_bump.setSingleStep(0.1)
+        self.spin_bump.setDecimals(2)
+        self.spin_bump.setValue(1.0)
+        self.spin_bump.setToolTip("Fuerza del relieve (normal-map) de "
+                                  "piedras, ladrillos y revestimientos")
+        self.spin_bump.valueChanged.connect(self._on_bump)
+        fx.addWidget(self.spin_bump)
+
+        fx.addWidget(QLabel("Césped/m²", row2))
+        self.spin_grass = QDoubleSpinBox(row2)
         self.spin_grass.setRange(0.0, 200.0)
         self.spin_grass.setSingleStep(5.0)
         self.spin_grass.setDecimals(0)
@@ -1686,12 +2508,10 @@ class WorldWindow(QDialog):
         self.spin_grass.setToolTip("Densidad de hojas por metro cuadrado de "
                                    "césped (0 = sin césped)")
         self.spin_grass.valueChanged.connect(self._on_density)
-        lay.addWidget(self.spin_grass)
+        fx.addWidget(self.spin_grass)
 
-        lay.addStretch(1)
-        hint = QLabel("arrastra para mirar · W/A/S/D mover · Esc cerrar", bar)
-        hint.setEnabled(False)
-        lay.addWidget(hint)
+        fx.addStretch(1)
+        outer.addWidget(row2)
         return bar
 
     def _on_shadows(self, on: bool) -> None:
@@ -1719,25 +2539,71 @@ class WorldWindow(QDialog):
         self.view.mark_dirty()
         self.view.update()
 
+    def _on_ssr(self, on: bool) -> None:
+        self.view.ssr = bool(on)
+        self.view.update()
+
+    def _on_ssao(self, on: bool) -> None:
+        self.view.ssao = bool(on)
+        self.view.update()
+
+    def _on_bloom(self, on: bool) -> None:
+        self.view.bloom = bool(on)
+        self.view.update()
+
+    def _on_sky(self, idx: int) -> None:
+        self.view.sky_preset = int(idx)
+        self.view.update()
+
+    def _on_env(self, v: float) -> None:
+        self.view.env = float(v)
+        self.view.update()
+
+    def _on_floor(self, v: float) -> None:
+        self.view.floor_gloss = float(v)
+        self.view.update()
+
+    def _on_bump(self, v: float) -> None:
+        self.view.bump = float(v)
+        self.view.update()
+
     def _load_view_state(self) -> None:
         s = self.settings
+
+        def _flag(key, default=True):
+            return str(s.value(_SETTINGS + key,
+                               "true" if default else "false")).lower() \
+                in ("1", "true")
+
         try:
-            self.view.shadows = str(s.value(_SETTINGS + "shadows",
-                                            "true")).lower() in ("1", "true")
+            self.view.shadows = _flag("shadows")
             self.view.exposure = float(s.value(_SETTINGS + "exposure", 1.05))
             self.view.ambient = float(s.value(_SETTINGS + "ambient", 0.55))
-            self.view.grass = str(s.value(_SETTINGS + "grass",
-                                          "true")).lower() in ("1", "true")
-            self.view.wind = str(s.value(_SETTINGS + "wind",
-                                         "true")).lower() in ("1", "true")
+            self.view.grass = _flag("grass")
+            self.view.wind = _flag("wind")
             self.view.grass_density = float(
                 s.value(_SETTINGS + "grass_density", 45.0))
+            self.view.ssr = _flag("ssr")
+            self.view.ssao = _flag("ssao")
+            self.view.bloom = _flag("bloom")
+            self.view.env = float(s.value(_SETTINGS + "env", 0.40))
+            self.view.floor_gloss = float(s.value(_SETTINGS + "floor", 0.35))
+            self.view.bump = float(s.value(_SETTINGS + "bump", 1.0))
+            self.view.sky_preset = int(s.value(_SETTINGS + "sky", 0))
             self.chk_shadows.setChecked(self.view.shadows)
             self.spin_exp.setValue(self.view.exposure)
             self.spin_amb.setValue(self.view.ambient)
             self.chk_grass.setChecked(self.view.grass)
             self.chk_wind.setChecked(self.view.wind)
             self.spin_grass.setValue(self.view.grass_density)
+            self.chk_ssr.setChecked(self.view.ssr)
+            self.chk_ssao.setChecked(self.view.ssao)
+            self.chk_bloom.setChecked(self.view.bloom)
+            self.cmb_sky.setCurrentIndex(
+                max(0, min(len(_SKY_PRESETS) - 1, self.view.sky_preset)))
+            self.spin_env.setValue(self.view.env)
+            self.spin_floor.setValue(self.view.floor_gloss)
+            self.spin_bump.setValue(self.view.bump)
         except (TypeError, ValueError):
             pass
 
@@ -1749,6 +2615,13 @@ class WorldWindow(QDialog):
         s.setValue(_SETTINGS + "grass", self.view.grass)
         s.setValue(_SETTINGS + "wind", self.view.wind)
         s.setValue(_SETTINGS + "grass_density", self.view.grass_density)
+        s.setValue(_SETTINGS + "ssr", self.view.ssr)
+        s.setValue(_SETTINGS + "ssao", self.view.ssao)
+        s.setValue(_SETTINGS + "bloom", self.view.bloom)
+        s.setValue(_SETTINGS + "env", self.view.env)
+        s.setValue(_SETTINGS + "floor", self.view.floor_gloss)
+        s.setValue(_SETTINGS + "bump", self.view.bump)
+        s.setValue(_SETTINGS + "sky", self.view.sky_preset)
         s.sync()
 
     def closeEvent(self, ev) -> None:
@@ -1772,10 +2645,12 @@ class ViRealPanel(QWidget):
         bl = QVBoxLayout(box)
         note = QLabel(
             "Abre una ventana flotante con el modelo iluminado: texturas "
-            "reales, sol y sombras, materiales con brillo (core.finish) y "
-            "cielo. Césped 3D que se mece con el viento en las superficies "
-            "con textura de césped/grass. Cámara libre tipo juego "
-            "(W/A/S/D + ratón).", box)
+            "reales, sol y sombras suaves, reflejos en tiempo real sobre "
+            "pisos brillantes, vidrio y metal, relieve en piedras y "
+            "ladrillos, sombra ambiental y bloom. Césped 3D que se mece con "
+            "el viento en las superficies con textura de césped/grass, y "
+            "paletas de cielo (día, atardecer, nublado, noche). Cámara libre "
+            "tipo juego (W/A/S/D + ratón).", box)
         note.setWordWrap(True)
         bl.addWidget(note)
         btn = QPushButton("▶  Abrir ventana ViReal", box)

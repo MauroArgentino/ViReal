@@ -2,6 +2,51 @@
 
 Todas las fechas son en formato AAAA-MM-DD.
 
+## [0.3.0] — 2026-10-15
+
+Reescritura del motor de render: pasa de un pase directo a un **pipeline HDR con
+*post-proceso*** (G-buffer MRT → SSAO → SSR → *bloom* → composición).
+
+### Añadido
+- **Reflejos en tiempo real (SSR)**: los pisos brillantes, el vidrio y el metal
+  reflejan la escena que los rodea, mezclado con Fresnel por ángulo de visión y
+  por rugosidad. Sobre los bordes de pantalla cae a un reflejo analítico del
+  cielo. Tecla `F` y casilla **Reflejos**.
+- **Reflejos de entorno** en el *shader* principal (aproximación IBL que
+  muestrea el cielo analítico) con un control de intensidad **reflejos de
+  entorno**.
+- **Pisos glossy**: los materiales cuyo nombre suena a piso pulido
+  (porcelanato, mármol, granito, cerámica, terrazo, laca, vinílico…) se vuelven
+  reflectantes, más un control global **Brillo de pisos** que baja la rugosidad
+  de las caras que miran hacia arriba.
+- **Relieve en las texturas**: se genera un *normal map* desde la propia
+  textura difusa (Sobel sobre la luminancia, cacheado) y se aplica con un marco
+  tangente por fragmento. Las **piedras, ladrillos y revestimientos** reciben un
+  relieve marcado; el resto, uno suave; el césped, ninguno. Control **Relieve**.
+- **Sombras suaves (PCSS)**: estimación del tamaño de la *penumbra* según la
+  distancia del receptor y filtrado PCF, en lugar del PCF 3×3 duro.
+- **SSAO**: oclusión ambiental *screen-space* sobre la posición y la normal.
+  Tecla `G` y casilla **Oclusión**.
+- ***Bloom***: *bright pass* + desenfoque separable (dos pasadas), que da halo
+  al sol y a las luces. Tecla `B` y casilla ***Bloom***.
+- **Paletas de cielo**: **Día**, **Atardecer**, **Nublado** y **Noche**, con el
+  sol teñido por la elevación real. Tecla `N` y desplegable en la barra.
+- **G-buffer MRT** (RGBA16F, 3 salidas) creado vía
+  `QOpenGLVersionFunctionsFactory`; si la GPU no lo soporta, el render cae
+  automáticamente a un camino de una sola salida (sin SSR/SSAO).
+
+### Cambiado
+- El *tone mapping* ACES y la gamma ahora se aplican en la **composición**, no
+  en cada *shader* de geometría (que pasan a emitir HDR lineal).
+- La barra superior pasa a **dos filas** para acomodar los controles nuevos.
+- El HUD informa del estado de reflejos, oclusión, *bloom* y paleta.
+
+### Notas
+- Los ajustes nuevos (reflejos, oclusión, *bloom*, entorno, brillo de pisos,
+  relieve, paleta) también se guardan entre sesiones.
+- La orientación del *normal map* derivado se ajusta al mismo espejado que la
+  textura difusa.
+
 ## [0.2.0] — 2026-10-15
 
 ### Añadido

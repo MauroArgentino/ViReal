@@ -3,7 +3,8 @@
 **ViReal** es una extensión para **IngeTrazo** que abre una **ventana flotante
 e independiente** con tu modelo convertido en una **escena iluminada y
 navegable**, con estética de motor de juego: texturas reales, sol con sombras
-proyectadas, materiales con brillo y un cielo fotográfico con exposición.
+suaves, materiales con brillo, **reflejos en tiempo real**, **relieve en las
+piedras**, oclusión ambiental, *bloom* y un cielo fotográfico con exposición.
 
 No es un visor de líneas más: es un pequeño «mundo» que puedes **recorrer a
 pie** con la cámara libre, mientras sigues modelando.
@@ -25,8 +26,26 @@ pie** con la cámara libre, mientras sigues modelando.
   **PBR aproximado** (Cook-Torrance GGX + difusa Lambert + ambiente
   hemisférico).
 - **Sol real del documento**: la dirección de la luz sale de `core.sun`
-  (latitud, longitud, fecha y hora del documento). **Sombras proyectadas** con
-  PCF 3×3 sobre un mapa de sombras empaquetado de 2048×2048.
+  (latitud, longitud, fecha y hora del documento). **Sombras suaves** (PCSS)
+  sobre un mapa de sombras empaquetado de 2048×2048, con un desenfoque que
+  crece con la distancia del receptor.
+- **Motor HDR con *post-proceso***: la escena se dibuja en *float* (RGBA16F) y
+  se procesa en pasos separados — **SSAO** (oclusión ambiental),
+  ***bloom*** (halo del sol y luces) y **composición** con *tone mapping* ACES
+  y gamma.
+- **Reflejos en tiempo real (SSR)**: los pisos brillantes, el vidrio y el metal
+  reflejan lo que tienen alrededor, mezclado con Fresnel por ángulo de visión y
+  por rugosidad. Se complementa con un reflejo analítico del cielo.
+- **Texturas con relieve**: a partir de la propia textura difusa se genera un
+  *normal map* (Sobel sobre la luminancia) que da **relieve a piedras,
+  ladrillos y revoques**; el césped y las superficies lisas quedan sin relieve.
+- **Materiales con brillo**: lee `core.materials`, `core.group` y
+  `core.finish` (roughness, metalness, transmisión, IOR) y aplica un sombreado
+  **PBR aproximado** (Cook-Torrance GGX + difusa Lambert + ambiente
+  hemisférico). Los pisos con nombre de material brillante
+  (porcelanato, mármol, granito, cerámica, pulido…) reciben además un acabado
+  **glossy** ajustable.
+- **Paletas de cielo**: día, atardecer, nublado y noche.
 - **Cielo fotográfico** con degradado y halo solar (no el fondo gris del CAD),
   **tone mapping ACES** y corrección gamma.
 - **Césped 3D**: las superficies cuya textura o material se llame
@@ -36,8 +55,9 @@ pie** con la cámara libre, mientras sigues modelando.
 - **Cámara libre tipo juego** (ratón + WASD) y **reencuadre automático** al
   abrir la ventana.
 - **Auto-actualización**: si cambias el modelo, la ventana lo reconstruye sola.
-- **Ajustes persistentes**: sombras, exposición, ambiente, césped, viento y
-  densidad de césped se recuerdan entre sesiones.
+- **Ajustes persistentes**: sombras, exposición, ambiente, césped, viento,
+  densidad de césped, reflejos, oclusión, *bloom*, relieve, brillo de pisos y
+  paleta de cielo se recuerdan entre sesiones.
 
 ---
 
@@ -92,12 +112,17 @@ Puedes abrir la ventana de dos formas:
 | `T`                | Activar / desactivar sombras             |
 | `C`                | Activar / desactivar el césped 3D        |
 | `V`                | Activar / desactivar el viento           |
+| `F`                | Activar / desactivar reflejos (SSR)      |
+| `G`                | Activar / desactivar oclusión (SSAO)     |
+| `B`                | Activar / desactivar *bloom*             |
+| `N`                | Cambiar de paleta de cielo               |
 | `Esc`              | Cerrar la ventana                        |
 
 En la barra superior de la ventana tienes botones para **Actualizar**,
-**Reencuadrar**, alternar **Sombras**, **Césped 3D** y **Viento**, y ajustar
-**Exposición**, **Ambiente** y la **densidad de césped** (hojas por m²; 0 lo
-desactiva).
+**Reencuadrar**, alternar **Sombras**, **Césped 3D**, **Viento**, **Reflejos**,
+**Oclusión** y ***Bloom***, elegir la **paleta de cielo** y ajustar
+**Exposición**, **Ambiente**, **densidad de césped** (hojas por m²; 0 lo
+desactiva), **reflejos de entorno**, **brillo de pisos** y **relieve**.
 
 ---
 
@@ -114,12 +139,15 @@ ViReal no refleja el viewport: construye su propia escena leyendo el modelo.
    UV que da `core.texture.face_uv_axes`.
 3. **Materiales**: `core.materials.effective_attrs`,
    `core.group.effective_material` y `core.finish.PBR`/`resolve` alimentan los
-   parámetros PBR de cada run.
+   parámetros PBR de cada run. Un *normal map* se **deriva de la propia textura
+   difusa** (Sobel sobre la luminancia, cacheado) para dar relieve a piedras y
+   ladrillos; los nombres de material se inspeccionan para decidir qué es
+   glossy y qué tiene relieve.
 4. **Luz y sombras**: se construye una matriz ortográfica de luz a partir de la
    dirección del sol; se renderiza un mapa de profundidad de 2048² y en el pase
-   principal se compara con PCF 3×3 (con sesgo por pendiente y corrección del
-   plano receptor para evitar acné). El mapa se cachea y sólo se rehace cuando
-   cambia la escena (no depende de la cámara).
+   principal se compara con **PCSS** (sombras suaves: estimación del tamaño del
+   *penumbra* + PCF). El mapa se cachea y sólo se rehace cuando cambia la escena
+   (no depende de la cámara).
 5. **Césped 3D**: las caras detectadas como césped se triangulan y sobre ellas
    se siembra un número de hojas proporcional a su área (hasta un tope). Cada
    hoja es una cinta afilada de 3 triángulos, con altura, ancho, inclinación,
@@ -128,8 +156,17 @@ ViReal no refleja el viewport: construye su propia escena leyendo el modelo.
    desfasados (ráfagas de viento) ponderados por la altura; reciben las sombras
    del sol. La siembra es determinista, así que el césped no «salta» al
    reconstruir por cambios ajenos.
-6. **Presentación**: cielo con degradado y disco solar, *tone mapping* ACES,
-   gamma 2.2 y un HUD dibujado con `QPainter` sobre el widget.
+6. **Motor HDR y *post-proceso***: la escena se dibuja a un
+   `QOpenGLFramebufferObject` RGBA16F con **tres salidas** (color, normal +
+   rugosidad, posición) mediante MRT. Sobre ese *G-buffer* corren, en pasos
+   separados, **SSAO** (oclusión ambiental a partir de la posición y la
+   normal), **SSR** (reflejos en pantalla que marchan el rayo reflejado por el
+   *buffer* de posición), ***bright pass* + *blur*** (*bloom*) y la
+   **composición** final, que aplica ACES, gamma, viñeta y el HUD con
+   `QPainter`.
+7. **Presentación**: cielo con degradado y disco solar (elegible por paleta),
+   *tone mapping* ACES, gamma 2.2 y un HUD dibujado con `QPainter` sobre el
+   widget.
 
 ---
 
@@ -150,30 +187,35 @@ ingetrazo_vireal/
 ## Empaquetado para publicar
 
 ```powershell
-./build_zip.ps1 -Version 0.2.0
+./build_zip.ps1 -Version 0.3.0
 ```
 
-Genera `dist/ingetrazo_vireal-0.2.0.zip` con `vireal.py`, `README.md`,
+Genera `dist/ingetrazo_vireal-0.3.0.zip` con `vireal.py`, `README.md`,
 `LICENSE` y `CHANGELOG.md`. El usuario final sólo necesita copiar `vireal.py`
 a su carpeta de plugins. Recuerda subir también `dist/` a la *release* de
 GitHub (o adjuntar el `.zip`).
+
+> Si omites `-Version`, el script la lee automáticamente de `__version__` en
+> `vireal.py`.
 
 ---
 
 ## Limitaciones conocidas y hoja de ruta
 
 - El núcleo de IngeTrazo **no expone *material maps* PBR** (normal, roughness,
-  AO), así que el realismo es «aproximado»: color, rugosidad, metalicidad y
-  transmisión, pero no relieve. Es el máximo que permite el modelo de datos.
-- Sin **reflejos de entorno reales**, **SSAO** ni **anti-aliasing** más allá
-  del MSAA del *surface*.
+  AO), así que el realismo es «aproximado». El **relieve** se deriva de la
+  textura difusa (Sobel), no de un *normal map* real; cuando el modelo de datos
+  los exponga, se usarán directamente.
+- **Reflejos (SSR)** y **oclusión (SSAO)** son *screen-space*: sólo ven lo que
+  está en pantalla; lo que queda fuera cae al reflejo analítico del cielo. En
+  GPUs sin OpenGL 3.3 con MRT se desactivan solos y el render sigue funcionando.
 - El **césped 3D** es geométrico (hojas sueltas, no *tufts* con textura
   alfa), no se auto-sombra entre hojas y se siembra al reconstruir la escena:
   en céspedes muy grandes, más densidad = más hojas = más trabajo por
   reconstrucción. La densidad es ajustable desde la barra.
-- Ideas para próximas versiones: reflejos por entorno, *bloom* suave, suelo y
-  césped de terreno continuo, más hojas *instanced* (GPU) para densidades muy
-  altas, sombras suaves (PCSS) y una paleta de cielos elegible.
+- Ideas para próximas versiones: más hojas *instanced* (GPU) para densidades
+  muy altas, *water/refraction* real, niebla volumétrica, *depth of field* y
+  terreno de césped continuo.
 
 ---
 
