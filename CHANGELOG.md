@@ -2,6 +2,35 @@
 
 Todas las fechas son en formato AAAA-MM-DD.
 
+## [0.4.0] — 2026-10-16
+
+Iluminación **física**: el cielo y la luz del sol salen de un modelo atmosférico
+real en vez de una paleta de colores fija.
+
+### Añadido
+- **Cielo atmosférico** (dispersión **Rayleigh + Mie**): el gradiente del cielo,
+  el blanqueo del horizonte, el azul del cenit y el enrojecimiento del atardecer
+  se calculan con un modelo de masa de aire. El sol tiene **disco y aureola**
+  con borde suave.
+- **Sol físico**: el color y la intensidad de la luz directa dependen de la
+  **elevación solar real** del documento — blanco al mediodía, cálido y tenue al
+  atardecer, apagado de noche — mediante la transmitancia atmosférica.
+- **Ambiente por el cielo (IBL aproximado)**: el relleno de sombra se integra
+  muestreando el propio modelo de cielo alrededor de la normal, así que cambia de
+  color con la hora y con la orientación de cada cara (el suelo rebota distinto
+  que el cielo).
+- **Reflejos coherentes con el fondo**: el *shader* de geometría refleja el
+  **mismo cielo** que se ve de fondo.
+- **Brillo especular suave**: el lóbulo especular se ensancha según el tamaño
+  angular del sol (y la bruma), de modo que los reflejos en pisos glossy son
+  manchas suaves y no un punto duro.
+
+### Cambiado
+- Las **paletas** (Día, Atardecer, Nublado, Noche) ya no fijan los colores: sólo
+  ajustan el *look* (tinte del sol y del cielo, turbidez y brillo base) sobre la
+  base física.
+- El *shader* del **césped** usa el mismo modelo de sol y cielo.
+
 ## [0.3.0] — 2026-10-15
 
 Reescritura del motor de render: pasa de un pase directo a un **pipeline HDR con

@@ -5,10 +5,10 @@
 Abre una **ventana flotante independiente** con su propio contexto OpenGL y
 su propio renderizado: coge la geometría visible del modelo, la triangula, le
 aplica las texturas reales y los *finishes* (core.finish: roughness,
-metalness, transmisión) y la ilumina con el **sol real** del documento, sombras
-proyectadas, ambiente hemisférico (cielo/suelo del estilo), *tone mapping* ACES
-y corrección gamma. El resultado es un «ViReal» navegable a pie, con cámara
-libre tipo juego (ratón + WASD), no el aspecto de línea de un CAD.
+metalness, transmisión) y la ilumina con el **sol real** del documento, un
+cielo y un ambiente atmosféricos físicos, sombras proyectadas, *tone mapping*
+ACES y corrección gamma. El resultado es un «ViReal» navegable a pie, con
+cámara libre tipo juego (ratón + WASD), no el aspecto de línea de un CAD.
 
 No pretende ser Unreal Engine (IngeTrazo no expone shaders PBR ni material
 maps), pero sí da el salto de «dibujo» a «escena iluminada»: superficies con
@@ -35,6 +35,14 @@ Desde 0.3.0 el motor es un *pipeline* HDR con post-proceso:
 * **Sombras suaves** (PCSS) con penumbra que crece con la distancia.
 * **Sombra ambiental** (SSAO) que asienta los objetos sobre el suelo.
 * **Bloom** solar y paletas de cielo (día, atardecer, nublado, noche).
+
+Desde 0.4.0 la iluminación es **física**: un modelo atmosférico (dispersión
+Rayleigh + Mie) genera el cielo real y de él salen el color y la intensidad del
+sol según su elevación real (blanco al mediodía, naranja y tenue al atardecer,
+apagado de noche), el ambiente por muestreo del propio cielo (IBL aproximado) y
+un brillo especular suave acorde al tamaño angular del sol. El **mismo cielo**
+que se ve de fondo es el que se refleja en las superficies. Las paletas (día,
+atardecer, nublado, noche) sólo ajustan el *look* sobre esa base física.
 
 Instalar: copiar este archivo en la carpeta de plugins
 (Extensiones ▸ Abrir carpeta de plugins) y reiniciar IngeTrazo.
@@ -87,7 +95,7 @@ from PySide6.QtWidgets import (
 log = logging.getLogger("ingetrazo.plugins.vireal")
 
 #: Versión de la extensión (coincide con el CHANGELOG y el paquete .zip).
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 _SETTINGS = "vireal/"
 
@@ -137,20 +145,20 @@ GL_COLOR_ATTACHMENT2 = 0x8CE2
 
 #: Nombres de los uniformes de cada programa (PySide6 exige ``bytes`` en
 #: ``uniformLocation`` y la localización para valores float/int).
-_MAIN_UNIFORMS = (
-    "u_mvp", "u_cam", "u_sun_dir", "u_sun_col", "u_sky_col", "u_gnd_col",
-    "u_ambient", "u_shadow_strength", "u_light_vp",
+_ATMO_UNIFORMS = (
+    "u_sun_dir", "u_sun_tint", "u_sky_tint", "u_gnd_col", "u_sky_floor",
+    "u_mie", "u_ambient",
+)
+_MAIN_UNIFORMS = _ATMO_UNIFORMS + (
+    "u_mvp", "u_cam", "u_shadow_strength", "u_light_vp",
     "u_shadow_enable", "u_shadow", "u_tex", "u_color", "u_opacity",
     "u_use_texture", "u_use_bump", "u_bump", "u_bump_strength",
     "u_env", "u_floor_gloss",
 )
-_SKY_UNIFORMS = (
-    "u_inv_vp", "u_cam", "u_sun_dir", "u_sun_col", "u_sky_col", "u_gnd_col",
-)
+_SKY_UNIFORMS = _ATMO_UNIFORMS + ("u_inv_vp", "u_cam")
 _DEPTH_UNIFORMS = ("u_light_vp",)
-_GRASS_UNIFORMS = (
-    "u_mvp", "u_cam", "u_sun_dir", "u_sun_col", "u_sky_col", "u_gnd_col",
-    "u_ambient", "u_shadow_enable", "u_shadow",
+_GRASS_UNIFORMS = _ATMO_UNIFORMS + (
+    "u_mvp", "u_cam", "u_shadow_enable", "u_shadow",
     "u_light_vp", "u_shadow_strength", "u_time", "u_wind_dir",
     "u_wind_strength",
 )
@@ -161,10 +169,9 @@ _SSAO_UNIFORMS = (
 _BRIGHT_UNIFORMS = ("u_tex", "u_threshold", "u_knee")
 _BLUR_UNIFORMS = ("u_tex", "u_dir", "u_texel")
 _COMPOSITE_UNIFORMS = (
-    "u_color", "u_ao", "u_bloom", "u_pos", "u_mat", "u_cam", "u_sun_dir",
-    "u_sun_col", "u_sky_col", "u_gnd_col", "u_view", "u_proj", "u_exposure",
-    "u_ao_strength", "u_bloom_amount", "u_env", "u_ssr_enable",
-    "u_ssr_strength", "u_vignette",
+    "u_color", "u_ao", "u_bloom", "u_pos", "u_mat", "u_cam", "u_view",
+    "u_proj", "u_exposure", "u_ao_strength", "u_bloom_amount", "u_env",
+    "u_ssr_enable", "u_ssr_strength", "u_vignette",
 )
 
 #: Tamaño del mapa de sombras (px).
@@ -204,13 +211,19 @@ _STONE_WORDS = ("piedra", "stone", "rock", "roca", "ladrillo", "brick",
                 "mamposteria", "block", "hormigon visto", "texturado",
                 "travertino", "laja", "canto", "aspero", "rugoso")
 
-#: Paletas de cielo: (etiqueta, cielo, suelo, sol). El sol se tiñe con la
-#: elevación real, así que estas son sólo el color base.
+#: Paletas de cielo. Cada preset ajusta el modelo atmosférico:
+#: (etiqueta, tinte del sol, tinte del cielo, turbidez Mie, brillo base del
+#: cielo, color del suelo/rebote). El color y la intensidad reales del sol
+#: salen de la física (elevación solar); esto sólo es el «look» de la paleta.
 _SKY_PRESETS = (
-    ("Día", (0.46, 0.64, 0.92), (0.30, 0.29, 0.27), (1.00, 0.96, 0.88)),
-    ("Atardecer", (0.66, 0.52, 0.58), (0.24, 0.19, 0.17), (1.00, 0.62, 0.32)),
-    ("Nublado", (0.74, 0.77, 0.81), (0.36, 0.36, 0.35), (0.92, 0.93, 0.95)),
-    ("Noche", (0.045, 0.06, 0.12), (0.02, 0.025, 0.04), (0.32, 0.38, 0.58)),
+    ("Día", (1.00, 1.00, 1.00), (1.00, 1.00, 1.00), 1.0, (0.0, 0.0, 0.0),
+     (0.10, 0.10, 0.10)),
+    ("Atardecer", (1.05, 0.80, 0.58), (1.00, 0.95, 0.95), 1.7,
+     (0.004, 0.004, 0.007), (0.07, 0.05, 0.04)),
+    ("Nublado", (0.32, 0.33, 0.36), (0.72, 0.74, 0.78), 3.2,
+     (0.030, 0.031, 0.036), (0.16, 0.16, 0.16)),
+    ("Noche", (0.05, 0.06, 0.11), (0.035, 0.050, 0.100), 0.6,
+     (0.17, 0.22, 0.30), (0.015, 0.02, 0.035)),
 )
 
 #: Color de la hoja cuando no se puede leer la textura del suelo.
@@ -237,6 +250,98 @@ _NORMAL_CACHE: dict = {}
 # ---------------------------------------------------------------------------
 # Shaders
 # ---------------------------------------------------------------------------
+
+#: Modelo atmosférico analítico (dispersión Rayleigh + Mie) compartido por los
+#: shaders. Genera el color del cielo, el color/intensidad del sol según su
+#: elevación real y un ambiente aproximado por muestreo del cielo (IBL).
+#: Se incluye tal cual en cada fragment shader (los uniforms que usa ya están
+#: declarados aquí, así que los shaders que lo incluyen no deben repetirlos).
+_ATMO_GLSL = """
+uniform vec3 u_sun_dir;      // unitaria, hacia el sol
+uniform vec3 u_sun_tint;     // tinte/intensidad del sol (paleta)
+uniform vec3 u_sky_tint;     // tinte del cielo (paleta)
+uniform vec3 u_gnd_col;      // rebote del suelo / color bajo el horizonte
+uniform vec3 u_sky_floor;    // brillo base del cielo (noche, nublado)
+uniform float u_mie;         // turbidez (Mie): bruma / nubes
+uniform float u_ambient;     // multiplicador global de ambiente
+
+const float ATMO_PI = 3.14159265359;
+// Profundidades ópticas cenitales (Rayleigh por canal, Mie acromática).
+const vec3  ATMO_OD_R = vec3(0.045, 0.105, 0.180);
+const float ATMO_OD_M = 0.021;
+const float ATMO_G    = 0.760;   // asimetría Mie (hacia delante)
+const float ATMO_SKY  = 105.0;   // escala de la dispersión del cielo
+const float ATMO_SUN  = 3.4;     // radiancia del sol directo
+const float ATMO_DISC = 34.0;    // radiancia del disco solar
+const float ATMO_ANG  = 0.00465; // radio angular del sol (rad ≈ 0,27°)
+
+// Masa de aire (Kasten-Young simplificada): ~1 en el cenit, crece mucho en el
+// horizonte. Es lo que hace que el sol se enrojezca y se apague al atardecer.
+float atmoAirMass(float cz) {
+    cz = max(cz, -0.12);
+    return 1.0 / max(cz + 0.025 * exp(-11.0 * cz), 0.0015);
+}
+
+// Transmitancia de la atmósfera para una dirección con coseno cenital cz.
+vec3 atmoTrans(float cz) {
+    float am = atmoAirMass(cz);
+    return exp(-(ATMO_OD_R + vec3(ATMO_OD_M * 1.1 * u_mie)) * am);
+}
+
+float atmoPhaseR(float mu) {
+    return 3.0 / (16.0 * ATMO_PI) * (1.0 + mu * mu);
+}
+
+float atmoPhaseM(float mu) {
+    float g = ATMO_G;
+    float gg = g * g;
+    return (1.0 - gg)
+         / (4.0 * ATMO_PI * pow(max(1.0 + gg - 2.0 * g * mu, 1e-4), 1.5));
+}
+
+// Dispersión del cielo en la dirección (unitaria) *dir*, SIN el disco solar.
+vec3 skyScatter(vec3 dir) {
+    float am = atmoAirMass(dir.z);
+    vec3 attn = exp(-(ATMO_OD_R + vec3(ATMO_OD_M * 1.1 * u_mie)) * am);
+    float mu = dot(dir, u_sun_dir);
+    // La raíz deja que el cenit conserve azul al atardecer (la luz que lo
+    // ilumina viene de capas altas, menos extinguidas que el sol rasante).
+    vec3 sunT = sqrt(max(atmoTrans(u_sun_dir.z), vec3(0.0)));
+    vec3 insc = (ATMO_OD_R * atmoPhaseR(mu)
+                 + vec3(ATMO_OD_M * u_mie) * atmoPhaseM(mu)) * (1.0 - attn);
+    vec3 col = ATMO_SKY * u_sky_tint * sunT * insc + u_sky_floor * u_sky_tint;
+    // Bajo el horizonte: rebote del suelo.
+    float below = smoothstep(0.0, -0.12, dir.z);
+    return mix(col, u_gnd_col, below);
+}
+
+// Cielo completo (dispersión + disco solar con borde suave).
+vec3 skyRadiance(vec3 dir) {
+    vec3 col = skyScatter(dir);
+    float mu = dot(dir, u_sun_dir);
+    float ang = acos(clamp(mu, -1.0, 1.0));
+    float disc = 1.0 - smoothstep(ATMO_ANG * 0.7, ATMO_ANG * 1.3, ang);
+    col += ATMO_DISC * u_sun_tint * atmoTrans(u_sun_dir.z) * disc;
+    return col;
+}
+
+// Luz solar directa (color HDR × intensidad), con extinción y apagado de noche.
+vec3 sunLight() {
+    float day = smoothstep(-0.04, 0.10, u_sun_dir.z);
+    return ATMO_SUN * u_sun_tint * atmoTrans(u_sun_dir.z) * day;
+}
+
+// Ambiente aproximado (IBL): tres muestras del cielo alrededor de la normal.
+// Para una normal hacia abajo las muestras caen bajo el horizonte y toma el
+// color de rebote del suelo, así el relleno de sombra cambia según la cara.
+vec3 skyAmbient(vec3 n) {
+    vec3 up = vec3(0.0, 0.0, 1.0);
+    return skyScatter(normalize(n + up * 0.5)) * 0.50
+         + skyScatter(up) * 0.25
+         + skyScatter(normalize(n * 0.6 - up * 0.4)) * 0.25;
+}
+"""
+
 _VERT = """
 #version 330 core
 layout(location = 0) in vec3 a_pos;
@@ -267,12 +372,8 @@ in vec3 v_nrm;
 in vec2 v_uv;
 in vec3 v_col;
 in vec3 v_pbr;
+""" + _ATMO_GLSL + """
 uniform vec3 u_cam;
-uniform vec3 u_sun_dir;      // unitaria, hacia el sol
-uniform vec3 u_sun_col;
-uniform vec3 u_sky_col;
-uniform vec3 u_gnd_col;
-uniform float u_ambient;
 uniform vec3 u_color;        // tinte extra (normalmente blanco)
 uniform int u_use_texture;
 uniform sampler2D u_tex;
@@ -299,16 +400,6 @@ const vec2 POISSON[12] = vec2[12](
 
 float unpackDepth(vec3 e) {
     return dot(e, vec3(1.0, 1.0 / 255.0, 1.0 / 65025.0));
-}
-
-// Mapa de entorno analítico: el mismo modelo que el shader del cielo, así los
-// reflejos son coherentes con lo que se ve de fondo (IBL aproximado).
-vec3 envSky(vec3 dir) {
-    float up = clamp(dir.z, -1.0, 1.0);
-    vec3 s = mix(u_gnd_col * 0.75, u_sky_col, smoothstep(-0.04, 0.55, up));
-    float sd = max(dot(dir, normalize(u_sun_dir)), 0.0);
-    s += u_sun_col * (pow(sd, 900.0) * 6.0 + pow(sd, 24.0) * 0.18);
-    return s * (0.35 + 0.65 * u_ambient);
 }
 
 // Sombras suaves (PCSS): se busca la profundidad media de los bloqueadores y
@@ -408,8 +499,12 @@ void main() {
 
     float sh = shadowFactor(v_world, ndl);
 
-    // Cook-Torrance GGX (aproximación difusa Lambert de kd = 1 - F).
-    float a = max(rough * rough, 1e-3);
+    // Cook-Torrance GGX. El sol tiene un tamaño angular finito y la bruma lo
+    // agranda: se ensancha el lóbulo especular para que el brillo sea suave
+    // (un reflejo realista) en vez de un punto duro.
+    float sunSoft = 0.015 + 0.028 * min(u_mie, 3.0);
+    float rr = min(rough + sunSoft, 1.0);
+    float a = max(rr * rr, 1e-3);
     float a2 = a * a;
     float denom = ndh * ndh * (a2 - 1.0) + 1.0;
     float D = a2 / (3.141593 * denom * denom);
@@ -421,16 +516,20 @@ void main() {
     vec3 spec = D * G * F / (4.0 * ndl * ndv + 1e-4);
     vec3 kd = (1.0 - F) * (1.0 - metal);
 
-    vec3 direct = (kd * albedo / 3.141593 + spec) * u_sun_col * ndl * sh;
+    // Luz solar directa: color e intensidad salen del modelo atmosférico
+    // (blanco al mediodía, naranja y tenue al atardecer, apagada de noche).
+    vec3 sun = sunLight();
+    vec3 direct = (kd * albedo / 3.141593 + spec) * sun * ndl * sh;
 
-    float hemi = N.z * 0.5 + 0.5;
-    vec3 amb = albedo * mix(u_gnd_col, u_sky_col, hemi) * u_ambient;
+    // Ambiente: se integra el propio cielo muestreado alrededor de la normal
+    // (IBL aproximado), así el relleno de sombra toma el color real del cielo.
+    vec3 amb = albedo * skyAmbient(N) * u_ambient;
 
-    // Reflejo del entorno (IBL aproximado): Fresnel y rugosidad.
+    // Reflejo del entorno: el mismo cielo que se ve de fondo, difuminado con
+    // la rugosidad (se mezcla con el ambiente difuso).
     vec3 R = reflect(-V, N);
-    vec3 env = envSky(R);
-    vec3 avgEnv = mix(u_gnd_col, u_sky_col, 0.55) * (0.35 + 0.65 * u_ambient);
-    env = mix(avgEnv, env, 1.0 - rough);
+    vec3 env = skyRadiance(R);
+    env = mix(skyAmbient(N), env, clamp(1.0 - rough * 1.6, 0.0, 1.0));
     float fres = pow(1.0 - ndv, 5.0);
     vec3 Fenv = F0 + (1.0 - F0) * fres;
     vec3 ambientSpec = env * Fenv * (1.0 - rough) * u_env;
@@ -439,7 +538,7 @@ void main() {
 
     if (trans > 0.0) {
         float fres2 = pow(1.0 - ndv, 3.0);
-        vec3 refl = mix(avgEnv, env, 0.7) * (0.25 + 0.75 * fres2);
+        vec3 refl = mix(skyAmbient(N), env, 0.7) * (0.25 + 0.75 * fres2);
         col = mix(col, refl + amb * 0.6, clamp(trans * 0.9, 0.0, 1.0));
     }
 
@@ -465,10 +564,7 @@ _SKY_FRAG = """
 in vec2 v_ndc;
 uniform mat4 u_inv_vp;
 uniform vec3 u_cam;
-uniform vec3 u_sun_dir;
-uniform vec3 u_sun_col;
-uniform vec3 u_sky_col;
-uniform vec3 u_gnd_col;
+""" + _ATMO_GLSL + """
 layout(location = 0) out vec4 out_color;
 layout(location = 1) out vec4 out_mat;
 layout(location = 2) out vec4 out_pos;
@@ -476,13 +572,9 @@ layout(location = 2) out vec4 out_pos;
 void main() {
     vec4 far = u_inv_vp * vec4(v_ndc, 1.0, 1.0);
     vec3 dir = normalize(far.xyz / far.w - u_cam);
-    float up = clamp(dir.z, -1.0, 1.0);
-    vec3 sky = mix(u_gnd_col * 0.75, u_sky_col,
-                   smoothstep(-0.04, 0.55, up));
-    // halo y disco solar (en HDR: el tonemap y el bloom van en el post)
-    float sd = max(dot(dir, normalize(u_sun_dir)), 0.0);
-    sky += u_sun_col * (pow(sd, 900.0) * 8.0 + pow(sd, 24.0) * 0.22);
-    out_color = vec4(sky, 1.0);
+    // Cielo físico (dispersión + disco solar) en HDR: el tonemap y el bloom
+    // se aplican en el post-proceso.
+    out_color = vec4(skyRadiance(dir), 1.0);
     out_mat = vec4(0.0);   // el cielo no tiene normal: se salta SSR/SSAO
     out_pos = vec4(0.0);
 }
@@ -559,11 +651,7 @@ in vec3 v_nrm;
 in vec3 v_col;
 in float v_t;
 uniform vec3 u_cam;
-uniform vec3 u_sun_dir;
-uniform vec3 u_sun_col;
-uniform vec3 u_sky_col;
-uniform vec3 u_gnd_col;
-uniform float u_ambient;
+""" + _ATMO_GLSL + """
 uniform int u_shadow_enable;
 uniform sampler2D u_shadow;
 uniform mat4 u_light_vp;
@@ -615,12 +703,11 @@ void main() {
     float ndl = max(dot(N, L), 0.0);
     float sh = grassShadow(v_world);
 
-    vec3 direct = albedo * u_sun_col * ndl * sh / 3.141593 * 1.25;
-    float hemi = N.z * 0.5 + 0.5;
-    vec3 amb = albedo * mix(u_gnd_col, u_sky_col, hemi) * u_ambient;
+    vec3 direct = albedo * sunLight() * ndl * sh / 3.141593 * 1.25;
+    vec3 amb = albedo * skyAmbient(N) * u_ambient;
     vec3 col = direct + amb;
     // Translucencia aproximada: las puntas dejan pasar algo de sol.
-    col += albedo * u_sun_col * 0.07 * v_t * sh;
+    col += albedo * sunLight() * 0.07 * v_t * sh;
 
     out_color = vec4(col, 1.0);
     out_mat = vec4(N, 0.95);   // el césped es difuso: sin SSR
@@ -752,10 +839,6 @@ uniform sampler2D u_bloom;
 uniform sampler2D u_pos;
 uniform sampler2D u_mat;
 uniform vec3 u_cam;
-uniform vec3 u_sun_dir;
-uniform vec3 u_sun_col;
-uniform vec3 u_sky_col;
-uniform vec3 u_gnd_col;
 uniform mat4 u_view;
 uniform mat4 u_proj;
 uniform float u_exposure;
@@ -1958,8 +2041,6 @@ class WorldView(QOpenGLWidget):
         proj = self.camera.projection_matrix(aspect)
         mvp = proj * view
 
-        sky_col, gnd_col, sun_col, _reflect = self._palette()
-
         shadow_tex = self._render_shadow()
 
         fbo = self._ensure_scene_fbo(w, h)
@@ -1978,9 +2059,9 @@ class WorldView(QOpenGLWidget):
         gl.glClearColor(0.0, 0.0, 0.0, 0.0)
         gl.glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
-        self._draw_sky(mvp, sky_col, gnd_col, sun_col)
-        self._draw_world(mvp, sky_col, gnd_col, sun_col, shadow_tex, use_shadow)
-        self._draw_grass(mvp, sky_col, gnd_col, sun_col, shadow_tex, use_shadow)
+        self._draw_sky(mvp)
+        self._draw_world(mvp, shadow_tex, use_shadow)
+        self._draw_grass(mvp, shadow_tex, use_shadow)
         fbo.release()
 
         # --- SSAO ---
@@ -1990,22 +2071,18 @@ class WorldView(QOpenGLWidget):
         bloom_tex = self._render_bloom(texs)
 
         # --- composición final al widget ---
-        self._composite(w, h, view, proj, texs, ao_tex, bloom_tex,
-                        sky_col, gnd_col, sun_col)
+        self._composite(w, h, view, proj, texs, ao_tex, bloom_tex)
 
         self._draw_hud(w, h)
 
-    def _draw_sky(self, mvp, sky_col, gnd_col, sun_col) -> None:
+    def _draw_sky(self, mvp) -> None:
         if self._sky is None:
             return
         gl = self._gl
         self._sky.bind()
         self._sv(self._sky, self._ls, "u_inv_vp", self._invert(mvp))
         self._sv(self._sky, self._ls, "u_cam", self.camera.pos)
-        self._sv(self._sky, self._ls, "u_sun_dir", self._sun_dir)
-        self._sv(self._sky, self._ls, "u_sun_col", sun_col)
-        self._sv(self._sky, self._ls, "u_sky_col", sky_col)
-        self._sv(self._sky, self._ls, "u_gnd_col", gnd_col)
+        self._set_atmo(self._sky, self._ls)
         self._empty_vao.bind()
         gl.glDisable(GL_DEPTH_TEST)
         gl.glDrawArrays(GL_TRIANGLES, 0, 3)
@@ -2013,19 +2090,14 @@ class WorldView(QOpenGLWidget):
         self._empty_vao.release()
         self._sky.release()
 
-    def _draw_world(self, mvp, sky_col, gnd_col, sun_col, shadow_tex,
-                    use_shadow) -> None:
+    def _draw_world(self, mvp, shadow_tex, use_shadow) -> None:
         if not self._runs or self._prog is None:
             return
         gl = self._gl
         self._prog.bind()
         self._sv(self._prog, self._lm, "u_mvp", mvp)
         self._sv(self._prog, self._lm, "u_cam", self.camera.pos)
-        self._sv(self._prog, self._lm, "u_sun_dir", self._sun_dir)
-        self._sv(self._prog, self._lm, "u_sun_col", sun_col)
-        self._sv(self._prog, self._lm, "u_sky_col", sky_col)
-        self._sv(self._prog, self._lm, "u_gnd_col", gnd_col)
-        self._sv(self._prog, self._lm, "u_ambient", self.ambient)
+        self._set_atmo(self._prog, self._lm)
         self._sv(self._prog, self._lm, "u_env", self.env)
         self._sv(self._prog, self._lm, "u_floor_gloss", self.floor_gloss)
         self._sv(self._prog, self._lm, "u_shadow_strength", self.shadow_strength)
@@ -2073,8 +2145,7 @@ class WorldView(QOpenGLWidget):
         self._vao.release()
         self._prog.release()
 
-    def _draw_grass(self, mvp, sky_col, gnd_col, sun_col, shadow_tex,
-                    use_shadow) -> None:
+    def _draw_grass(self, mvp, shadow_tex, use_shadow) -> None:
         if not (self.grass and self._gcount and self._gprog is not None):
             return
         gl = self._gl
@@ -2082,11 +2153,7 @@ class WorldView(QOpenGLWidget):
         gprog.bind()
         self._sv(gprog, self._lg, "u_mvp", mvp)
         self._sv(gprog, self._lg, "u_cam", self.camera.pos)
-        self._sv(gprog, self._lg, "u_sun_dir", self._sun_dir)
-        self._sv(gprog, self._lg, "u_sun_col", sun_col)
-        self._sv(gprog, self._lg, "u_sky_col", sky_col)
-        self._sv(gprog, self._lg, "u_gnd_col", gnd_col)
-        self._sv(gprog, self._lg, "u_ambient", self.ambient)
+        self._set_atmo(gprog, self._lg)
         self._sv(gprog, self._lg, "u_shadow_strength", self.shadow_strength)
         self._sv(gprog, self._lg, "u_light_vp", self._light_vp)
         self._sv(gprog, self._lg, "u_shadow_enable", use_shadow)
@@ -2175,8 +2242,7 @@ class WorldView(QOpenGLWidget):
         gl.glEnable(GL_DEPTH_TEST)
         return a.texture()
 
-    def _composite(self, w, h, view, proj, texs, ao_tex, bloom_tex,
-                   sky_col, gnd_col, sun_col) -> None:
+    def _composite(self, w, h, view, proj, texs, ao_tex, bloom_tex) -> None:
         gl = self._gl
         if self._comp is None:
             return
@@ -2200,10 +2266,6 @@ class WorldView(QOpenGLWidget):
         self._sv(prog, self._lc, "u_pos", 3)
         self._sv(prog, self._lc, "u_mat", 4)
         self._sv(prog, self._lc, "u_cam", self.camera.pos)
-        self._sv(prog, self._lc, "u_sun_dir", self._sun_dir)
-        self._sv(prog, self._lc, "u_sun_col", sun_col)
-        self._sv(prog, self._lc, "u_sky_col", sky_col)
-        self._sv(prog, self._lc, "u_gnd_col", gnd_col)
         self._sv(prog, self._lc, "u_view", view)
         self._sv(prog, self._lc, "u_proj", proj)
         self._sv(prog, self._lc, "u_exposure", self.exposure)
@@ -2222,19 +2284,24 @@ class WorldView(QOpenGLWidget):
         prog.release()
         gl.glEnable(GL_DEPTH_TEST)
 
-    def _palette(self):
-        # Cielo fotográfico propio (no el fondo gris del CAD). La paleta base
-        # la fija el usuario; el sol se tiñe con la elevación real.
+    def _atmo(self):
+        """Parámetros de la paleta atmosférica elegida (sin la elevación del
+        sol: la física del sol la resuelven los shaders a partir de u_sun_dir)."""
         idx = max(0, min(len(_SKY_PRESETS) - 1, int(self.sky_preset)))
-        _name, sky_rgb, gnd_rgb, sun_rgb = _SKY_PRESETS[idx]
-        sky = QVector3D(*sky_rgb)
-        gnd = QVector3D(*gnd_rgb)
-        sun = QVector3D(*sun_rgb)
-        elev = max(0.0, self._sun_dir.z())
-        warm = 1.0 - min(1.0, elev * 1.6)
-        sun = _lerp3(sun, QVector3D(1.0, 0.62, 0.34), warm * 0.8 * min(1.0, idx + 1))
-        reflect = _lerp3(sky, QVector3D(1.0, 1.0, 1.0), 0.25)
-        return sky, gnd, sun, reflect
+        _name, sun_t, sky_t, mie, floor, gnd = _SKY_PRESETS[idx]
+        return (QVector3D(*sun_t), QVector3D(*sky_t), QVector3D(*gnd),
+                float(mie), QVector3D(*floor))
+
+    def _set_atmo(self, prog, locs) -> None:
+        """Sube los uniforms del modelo atmosférico a un programa."""
+        sun_t, sky_t, gnd, mie, floor = self._atmo()
+        self._sv(prog, locs, "u_sun_dir", self._sun_dir)
+        self._sv(prog, locs, "u_sun_tint", sun_t)
+        self._sv(prog, locs, "u_sky_tint", sky_t)
+        self._sv(prog, locs, "u_gnd_col", gnd)
+        self._sv(prog, locs, "u_mie", mie)
+        self._sv(prog, locs, "u_sky_floor", floor)
+        self._sv(prog, locs, "u_ambient", float(self.ambient))
 
     def _draw_hud(self, w: int, h: int) -> None:
         try:
@@ -2462,8 +2529,8 @@ class WorldWindow(QDialog):
 
         fx.addWidget(QLabel("Cielo", row2))
         self.cmb_sky = QComboBox(row2)
-        for name, _s, _g, _sn in _SKY_PRESETS:
-            self.cmb_sky.addItem(name)
+        for preset in _SKY_PRESETS:
+            self.cmb_sky.addItem(preset[0])
         self.cmb_sky.currentIndexChanged.connect(self._on_sky)
         fx.addWidget(self.cmb_sky)
 
@@ -2645,8 +2712,9 @@ class ViRealPanel(QWidget):
         bl = QVBoxLayout(box)
         note = QLabel(
             "Abre una ventana flotante con el modelo iluminado: texturas "
-            "reales, sol y sombras suaves, reflejos en tiempo real sobre "
-            "pisos brillantes, vidrio y metal, relieve en piedras y "
+            "reales, cielo y luz solar físicos (el sol se enrojece y se apaga "
+            "según su elevación real), sombras suaves, reflejos en tiempo real "
+            "sobre pisos brillantes, vidrio y metal, relieve en piedras y "
             "ladrillos, sombra ambiental y bloom. Césped 3D que se mece con "
             "el viento en las superficies con textura de césped/grass, y "
             "paletas de cielo (día, atardecer, nublado, noche). Cámara libre "
