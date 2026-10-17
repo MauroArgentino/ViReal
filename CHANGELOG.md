@@ -2,6 +2,41 @@
 
 Todas las fechas son en formato AAAA-MM-DD.
 
+## [0.5.0] — 2026-10-16
+
+Césped **instanciado en la GPU** con **LOD por distancia**: el césped pasa de
+un puñado de hojas sueltas a un **manto continuo** estilo Enscape.
+
+### Añadido
+- **GPU instancing** para el césped: una **hoja plantilla** (9 vértices) se
+  reutiliza para todas las instancias; los datos de cada hoja (raíz, marco de la
+  superficie, alto, ancho, tinte y fase de viento) van en **atributos por
+  instancia** (`glVertexAttribDivisor` + `glDrawArraysInstanced`). Se pasa de
+  ~20 000 a **hasta 200 000 hojas** en una sola llamada de dibujo.
+- **LOD por distancia**: las hojas lejanas se pliegan al suelo de forma suave
+  (`smoothstep`) y el **terreno texturizado hace de impostor** de césped. El
+  radio de LOD crece con el tamaño de la escena. Al reencuadrar todo el modelo
+  no se ven «hojas sueltas» a lo lejos; al caminar, el césped real aparece.
+- **Relieve suave en el césped**: las caras de césped ya no quedan planas; con
+  el terreno de impostor reciben un *normal-map* tenue para que la hierba se lea
+  como superficie, no como un piso pintado.
+
+### Cambiado
+- **Densidad de césped por defecto**: de 45 a **500 hojas/m²** (el control
+  llega ahora a 2000). El motor viejo, además, era 3× más lento sembrando; el
+  bucle nuevo evita objetos por instancia y siembra 200 000 hojas en ~0,5 s.
+- Cambiar la **densidad** ahora sólo **resiembra el césped**, sin reconstruir
+  toda la geometría del modelo (mucho más ágil con el control).
+- Migración de ajustes: si venías con la densidad por defecto antigua (45) se
+  sube una sola vez a 500; si la habías elegido a mano, se respeta.
+- El césped deja de forzar repintados del viento cuando está oculto.
+
+### Notas
+- Requiere soporte de *instancing* (OpenGL 3.3 lo incluye). Si el contexto no lo
+  diera, el césped 3D se desactiva solo y el resto del render sigue igual.
+- La siembra sigue siendo **determinista** (semilla fija): el césped no salta al
+  reconstruir por cambios ajenos.
+
 ## [0.4.0] — 2026-10-16
 
 Iluminación **física**: el cielo y la luz del sol salen de un modelo atmosférico

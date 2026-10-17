@@ -4,8 +4,8 @@
 e independiente** con tu modelo convertido en una **escena iluminada y
 navegable**, con estética de motor de juego: texturas reales, **sol y cielo
 físicos** con sombras suaves, materiales con brillo, **reflejos en tiempo
-real**, **relieve en las piedras**, oclusión ambiental, *bloom* y exposición
-fotográfica.
+real**, **relieve en las piedras**, **césped 3D instanciado** que se mece con el
+viento, oclusión ambiental, *bloom* y exposición fotográfica.
 
 No es un visor de líneas más: es un pequeño «mundo» que puedes **recorrer a
 pie** con la cámara libre, mientras sigues modelando.
@@ -43,7 +43,8 @@ pie** con la cámara libre, mientras sigues modelando.
   de fondo.
 - **Texturas con relieve**: a partir de la propia textura difusa se genera un
   *normal map* (Sobel sobre la luminancia) que da **relieve a piedras,
-  ladrillos y revoques**; el césped y las superficies lisas quedan sin relieve.
+  ladrillos y revoques**; el césped recibe uno tenue (para que el terreno de
+  impostor se lea como hierba) y las superficies lisas quedan sin relieve.
 - **Materiales con brillo**: lee `core.materials`, `core.group` y
   `core.finish` (roughness, metalness, transmisión, IOR) y aplica un sombreado
   **PBR aproximado** (Cook-Torrance GGX + difusa Lambert + ambiente del cielo).
@@ -54,10 +55,13 @@ pie** con la cámara libre, mientras sigues modelando.
   (tinte del sol y del cielo, turbidez, brillo base) sobre la base física.
 - **Cielo físico** con degradado atmosférico, horizonte y disco solar (no el
   fondo gris del CAD), **tone mapping ACES** y corrección gamma.
-- **Césped 3D**: las superficies cuya textura o material se llame
+- **Césped 3D instanciado**: las superficies cuya textura o material se llame
   «césped»/«grass» (también pasto, hierba, lawn, turf, grama, sod…) reciben
-  miles de hojas sembradas sobre la propia cara —con el verde medio de tu
-  textura— que **se mecen con el viento** y reciben las sombras del sol.
+  **cientos de miles de hojas instanciadas en la GPU** —con el verde medio de tu
+  textura— que **se mecen con el viento** y reciben las sombras del sol. Un
+  **LOD por distancia** pliega las hojas lejanas al suelo y el terreno texturizado
+  hace de *impostor*, de modo que el césped se lee como un **manto continuo**
+  (estilo Enscape) sin castigar el rendimiento.
 - **Cámara libre tipo juego** (ratón + WASD) y **reencuadre automático** al
   abrir la ventana.
 - **Auto-actualización**: si cambias el modelo, la ventana lo reconstruye sola.
@@ -156,13 +160,15 @@ ViReal no refleja el viewport: construye su propia escena leyendo el modelo.
    mapa de profundidad de 2048² y en el pase principal se compara con **PCSS**
    (sombras suaves: estimación del tamaño del *penumbra* + PCF). El mapa se
    cachea y sólo se rehace cuando cambia la escena (no depende de la cámara).
-5. **Césped 3D**: las caras detectadas como césped se triangulan y sobre ellas
-   se siembra un número de hojas proporcional a su área (hasta un tope). Cada
-   hoja es una cinta afilada de 3 triángulos, con altura, ancho, inclinación,
-   tono y color propios (teñidos con el color medio real de la textura). Un
-   programa aparte las dibuja y las deforma en el *vertex shader* con tres senos
-   desfasados (ráfagas de viento) ponderados por la altura; reciben las sombras
-   del sol. La siembra es determinista, así que el césped no «salta» al
+5. **Césped 3D instanciado**: las caras detectadas como césped se triangulan y
+   sobre ellas se siembra un número de hojas proporcional a su área (hasta un
+   tope de 200 000). Cada hoja no es geometría propia: es una **instancia** de
+   una **hoja plantilla** (9 vértices) con sus datos en atributos por instancia
+   (raíz, marco de la superficie, alto, ancho, tinte, fase). Se dibujan con
+   `glDrawArraysInstanced` en **una sola llamada**, deformadas en el *vertex
+   shader* con tres senos desfasados (ráfagas de viento). Un **LOD por
+   distancia** pliega las hojas lejanas al suelo (el terreno texturizado hace de
+   impostor). La siembra es determinista, así que el césped no «salta» al
    reconstruir por cambios ajenos.
 6. **Motor HDR y *post-proceso***: la escena se dibuja a un
    `QOpenGLFramebufferObject` RGBA16F con **tres salidas** (color, normal +
@@ -195,10 +201,10 @@ ingetrazo_vireal/
 ## Empaquetado para publicar
 
 ```powershell
-./build_zip.ps1 -Version 0.4.0
+./build_zip.ps1 -Version 0.5.0
 ```
 
-Genera `dist/ingetrazo_vireal-0.4.0.zip` con `vireal.py`, `README.md`,
+Genera `dist/ingetrazo_vireal-0.5.0.zip` con `vireal.py`, `README.md`,
 `LICENSE` y `CHANGELOG.md`. El usuario final sólo necesita copiar `vireal.py`
 a su carpeta de plugins. Recuerda subir también `dist/` a la *release* de
 GitHub (o adjuntar el `.zip`).
@@ -220,13 +226,15 @@ GitHub (o adjuntar el `.zip`).
 - La **atmósfera** es un modelo analítico de un solo pase (masa de aire), no un
   trazado de dispersión multicapa: reproduce bien el color del cielo, el
   horizonte y el enrojecimiento del atardecer, pero no nubes volumétricas.
-- El **césped 3D** es geométrico (hojas sueltas, no *tufts* con textura
-  alfa), no se auto-sombra entre hojas y se siembra al reconstruir la escena:
-  en céspedes muy grandes, más densidad = más hojas = más trabajo por
-  reconstrucción. La densidad es ajustable desde la barra.
-- Ideas para próximas versiones: más hojas *instanced* (GPU) para densidades
-  muy altas, *water/refraction* real, niebla volumétrica, *depth of field* y
-  terreno de césped continuo.
+- El **césped 3D** es geométrico (hojas instanciadas, no *tufts* con textura
+  alfa) y no se auto-sombra entre hojas. Se siembra al reconstruir la escena:
+  más densidad = más hojas, con un tope de 200 000 por reconstrucción (~0,5 s).
+  Un **LOD por distancia** pliega las hojas lejanas al suelo, así que sólo las
+  hojas **cercanas** cuestan relleno de píxeles. La densidad es ajustable desde
+  la barra.
+- Ideas para próximas versiones: *tufts* de césped con alfa, siembra
+  **relativa a la cámara** (resembrar sólo el entorno cercano para céspedes
+  enormes), *water/refraction* real, niebla volumétrica y *depth of field*.
 
 ---
 

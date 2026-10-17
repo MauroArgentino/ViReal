@@ -20,8 +20,11 @@ Extensiones (Ctrl+Alt+M), un panel «ViReal» con el botón de abrir y la ventan
 en sí. La ventana se refresca sola: si cambias el modelo, la reconstruye.
 
 Las superficies cuya textura o material se llame «césped»/«grass» (pasto,
-hierba, lawn, turf…) reciben **césped 3D**: miles de hojas sembradas sobre la
-cara que se mecen con el viento y reciben las sombras del sol.
+hierba, lawn, turf…) reciben **césped 3D**: cientos de miles de hojas
+**instanciadas en la GPU** sobre la cara, que se mecen con el viento y reciben
+las sombras del sol. Al alejarse, las hojas se recogen al suelo y el terreno
+texturizado hace de *impostor* (LOD por distancia): el césped se lee como un
+manto continuo —estilo Enscape— sin castigar el rendimiento.
 
 Desde 0.3.0 el motor es un *pipeline* HDR con post-proceso:
 
@@ -43,6 +46,13 @@ apagado de noche), el ambiente por muestreo del propio cielo (IBL aproximado) y
 un brillo especular suave acorde al tamaño angular del sol. El **mismo cielo**
 que se ve de fondo es el que se refleja en las superficies. Las paletas (día,
 atardecer, nublado, noche) sólo ajustan el *look* sobre esa base física.
+
+Desde 0.5.0 el césped se dibuja con **GPU instancing**: una hoja plantilla
+(9 vértices) reutilizada para todas las instancias, con los datos de cada hoja
+(raíz, marco de la superficie, alto, ancho, tinte, fase de viento) en atributos
+por instancia. Eso permite pasar de ~20 000 a cientos de miles de hojas en una
+sola llamada. Un **LOD por distancia** pliega las hojas lejanas al suelo para
+que el terreno texturizado haga de impostor de césped.
 
 Instalar: copiar este archivo en la carpeta de plugins
 (Extensiones ▸ Abrir carpeta de plugins) y reiniciar IngeTrazo.
@@ -95,7 +105,7 @@ from PySide6.QtWidgets import (
 log = logging.getLogger("ingetrazo.plugins.vireal")
 
 #: Versión de la extensión (coincide con el CHANGELOG y el paquete .zip).
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 _SETTINGS = "vireal/"
 
@@ -160,7 +170,7 @@ _DEPTH_UNIFORMS = ("u_light_vp",)
 _GRASS_UNIFORMS = _ATMO_UNIFORMS + (
     "u_mvp", "u_cam", "u_shadow_enable", "u_shadow",
     "u_light_vp", "u_shadow_strength", "u_time", "u_wind_dir",
-    "u_wind_strength",
+    "u_wind_strength", "u_lod",
 )
 _SSAO_UNIFORMS = (
     "u_pos", "u_mat", "u_view", "u_proj", "u_texel", "u_radius", "u_bias",
@@ -186,13 +196,26 @@ V_UV = 24
 V_COL = 32
 V_PBR = 44
 
-#: Vértice del césped (otro programa): pos(3) @0, nrm(3) @12, col(3) @24,
-#: datos(4) @36 (t 0..1, fase, flexibilidad, altura) → 52 bytes.
-G_STRIDE = 52
-G_POS = 0
-G_NRM = 12
-G_COL = 24
-G_DATA = 36
+#: Vértice de la plantilla del césped (9 vértices, se reutiliza por instancia):
+#: pos(3) @0, col(3) @12, t(1) @24 → 28 bytes.
+GT_STRIDE = 28
+GT_POS = 0
+GT_COL = 12
+GT_T = 24
+
+#: Datos por instancia de césped (un «bloque» por hoja):
+#: root(3) @0, up(3) @12, side(3) @24, bend(3) @36, meta(4): alto, ancho,
+#: flexibilidad, fase @48, tint(3) @64 → 76 bytes.
+GRASS_INST_STRIDE = 76
+GI_ROOT = 0
+GI_UP = 12
+GI_SIDE = 24
+GI_BEND = 36
+GI_META = 48
+GI_TINT = 64
+
+#: Nº de vértices de la hoja plantilla (3 triángulos).
+GRASS_TEMPLATE_VERTS = 9
 
 #: Palabras que marcan una textura o material de césped (se buscan sin
 #: acentos, sin extensión y en el nombre del archivo + su carpeta padre).
@@ -229,12 +252,24 @@ _SKY_PRESETS = (
 #: Color de la hoja cuando no se puede leer la textura del suelo.
 _GRASS_FALLBACK = (0.30, 0.45, 0.17)
 
+#: Colores del gradiente de la hoja plantilla (base, medio, punta). El tinte
+#: por instancia se multiplica por estos factores.
+BLADE_GRADIENT = ((0.50, 0.52, 0.50), (0.90, 0.92, 0.85), (1.12, 1.16, 0.95))
+
 #: Altura (m) y ancho (m) base de cada hoja de césped.
 GRASS_HEIGHT = 0.11
 GRASS_WIDTH = 0.014
 
-#: Tope de hojas por reconstrucción (una escena enorme no debe colgar la app).
-GRASS_MAX_BLADES = 20000
+#: Tope de hojas instanciadas por reconstrucción (una escena enorme no debe
+#: colgar la app). Con instancing el tope puede ser mucho más alto que antes.
+GRASS_MAX_BLADES = 200000
+
+#: LOD por distancia (m): las hojas se pliegan al suelo para que el terreno
+#: texturizado haga de impostor. ``GRASS_LOD_FAR`` se ajusta al tamaño de la
+#: escena entre estos valores.
+GRASS_LOD_NEAR = 16.0
+GRASS_LOD_FAR = 30.0
+GRASS_LOD_FAR_MAX = 90.0
 
 #: Velocidad/amplitud del viento por defecto.
 WIND_DIR = (0.80, 0.60)
@@ -608,37 +643,64 @@ void main() {
 
 _GRASS_VERT = """
 #version 330 core
-layout(location = 0) in vec3 a_pos;   // posición en reposo (mundo)
-layout(location = 1) in vec3 a_nrm;
-layout(location = 2) in vec3 a_col;
-layout(location = 3) in vec4 a_data;  // t (0..1), fase, flexibilidad, altura
+// Plantilla compartida (local): x = ancho, y = alto, z = curvatura.
+layout(location = 0) in vec3 a_pos;
+layout(location = 1) in vec3 a_col;    // gradiente de color de la hoja
+layout(location = 2) in float a_t;     // 0 base … 1 punta
+// Datos por instancia (una hoja cada uno).
+layout(location = 4) in vec3 a_root;   // raíz en mundo
+layout(location = 5) in vec3 a_up;     // normal de la superficie
+layout(location = 6) in vec3 a_side;   // eje lateral de la hoja
+layout(location = 7) in vec3 a_bend;   // curvatura = dirección × inclinación
+layout(location = 8) in vec4 a_meta;   // alto, ancho, flexibilidad, fase
+layout(location = 9) in vec3 a_tint;   // tinte por hoja (con su sombreado)
 uniform mat4 u_mvp;
+uniform vec3 u_cam;
 uniform float u_time;
 uniform vec2 u_wind_dir;
 uniform float u_wind_strength;
+uniform vec2 u_lod;                    // (inicio, fin) del desvanecido
 out vec3 v_world;
 out vec3 v_nrm;
 out vec3 v_col;
 out float v_t;
 void main() {
-    float t = a_data.x;
-    float phase = a_data.y;
-    float flex = a_data.z;
-    // Peso cuadrático: la base no se mueve y la punta sí. Tres senos
-    // desfasados dan ráfagas (no un vaivén uniforme).
+    float t = a_t;
+    vec3 up = normalize(a_up);
+    vec3 side = normalize(a_side);
+    vec3 bend = a_bend;
+    float h = a_meta.x;
+    float wid = a_meta.y;
+    float flex = a_meta.z;
+    float phase = a_meta.w;
+
+    // LOD: las hojas lejanas se recogen al suelo (el terreno texturizado hace
+    // de impostor de césped). El desvanecido evita el «pop».
+    float k = 1.0 - smoothstep(u_lod.x, u_lod.y, distance(a_root, u_cam));
+    float hh = h * k;
+
+    // Viento: peso cuadrático (la base no se mueve) + ráfagas desfasadas.
     float w = t * t;
     float s = sin(u_time * 1.9 + phase) * 0.6
             + sin(u_time * 3.7 + phase * 1.7) * 0.3
             + sin(u_time * 0.9 + phase * 0.5) * 0.5;
     float gust = 0.55 + 0.45 * s;
-    vec3 dir = normalize(vec3(u_wind_dir, 0.18));
-    float amp = u_wind_strength * flex * w * gust;
-    // vibración rápida en la punta (detalle)
-    amp += u_wind_strength * 0.12 * w * sin(u_time * 6.5 + phase * 3.1);
-    vec3 wp = a_pos + dir * amp;
+    vec3 wdir = normalize(vec3(u_wind_dir, 0.18));
+    float amp = u_wind_strength * flex * w * gust * k
+              + u_wind_strength * 0.12 * w * sin(u_time * 6.5 + phase * 3.1) * k;
+
+    vec3 wp = a_root
+            + side * (a_pos.x * wid)
+            + up   * (a_pos.y * hh)
+            + bend * (a_pos.z * k)
+            + wdir * amp;
+
+    // Normal de la hoja (dos caras): cara = fwd × up, fwd = up × side.
+    vec3 fwd = normalize(cross(up, side));
+    vec3 face_n = cross(fwd, up);
+    v_nrm = normalize(face_n * 0.6 + up * 0.5);
     v_world = wp;
-    v_nrm = a_nrm;
-    v_col = a_col;
+    v_col = a_col * a_tint;
     v_t = t;
     gl_Position = u_mvp * vec4(wp, 1.0);
 }
@@ -1094,27 +1156,24 @@ def _build_normal_map(path, size: int = 256):
     return out
 
 
-def _emit_blade(buf, root: QVector3D, nrm: QVector3D, tint, rng) -> None:
-    """Añade una hoja de césped (5 vértices → 3 triángulos) al buffer.
+def _emit_instance(buf, rx, ry, rz, nx, ny, nz, tint, rng) -> None:
+    """Añade **una instancia** de hoja (19 floats) al buffer.
 
-    Se hace todo con ``float`` sueltos (sin objetos ``QVector3D`` ni closures)
-    porque esto corre cientos de miles de veces y el coste se nota."""
-    ux, uy, uz = nrm.x(), nrm.y(), nrm.z()
-    ul = math.sqrt(ux * ux + uy * uy + uz * uz)
-    if ul < 1e-9:
-        ux, uy, uz = 0.0, 0.0, 1.0
-    else:
-        ux, uy, uz = ux / ul, uy / ul, uz / ul
+    Guarda el marco de la hoja (raíz, ``up``, ``side`` y ``bend``) en vez de
+    9 vértices ya transformados: la hoja plantilla se reutiliza en la GPU. Se
+    hace todo con ``float`` sueltos (sin objetos ``QVector3D``/closures) porque
+    esto corre cientos de miles de veces. ``n`` debe venir ya normalizado."""
+    ux, uy, uz = nx, ny, nz
 
     if abs(uz) < 0.9:
-        rx, ry, rz = 0.0, 0.0, 1.0
+        rx2, ry2, rz2 = 0.0, 0.0, 1.0
     else:
-        rx, ry, rz = 1.0, 0.0, 0.0
+        rx2, ry2, rz2 = 1.0, 0.0, 0.0
 
     # side0 = ref × up
-    sx = ry * uz - rz * uy
-    sy = rz * ux - rx * uz
-    sz = rx * uy - ry * ux
+    sx = ry2 * uz - rz2 * uy
+    sy = rz2 * ux - rx2 * uz
+    sz = rx2 * uy - ry2 * ux
     sl = math.sqrt(sx * sx + sy * sy + sz * sz)
     if sl < 1e-9:
         sx, sy, sz = 1.0, 0.0, 0.0
@@ -1129,81 +1188,79 @@ def _emit_blade(buf, root: QVector3D, nrm: QVector3D, tint, rng) -> None:
     ca = math.cos(ang)
     sa = math.sin(ang)
     # side y fwd son side0/fwd0 girados en su plano → siguen siendo unitarios
-    wx = sx * ca + fx * sa
-    wy = sy * ca + fy * sa
-    wz = sz * ca + fz * sa
-    dx = fx * ca - sx * sa
-    dy = fy * ca - sy * sa
-    dz = fz * ca - sz * sa
+    wxs = sx * ca + fx * sa
+    wys = sy * ca + fy * sa
+    wzs = sz * ca + fz * sa
+    wxf = fx * ca - sx * sa
+    wyf = fy * ca - sy * sa
+    wzf = fz * ca - sz * sa
 
     h = GRASS_HEIGHT * (0.6 + 0.8 * rng.random())
     wid = GRASS_WIDTH * (0.7 + 0.6 * rng.random())
     lean = h * (0.15 + 0.55 * rng.random())
 
-    bx = root.x() + ux * 0.004        # separación del suelo (evita z-fight)
-    by = root.y() + uy * 0.004
-    bz = root.z() + uz * 0.004
+    bx = rx + ux * 0.004              # separación del suelo (evita z-fight)
+    by = ry + uy * 0.004
+    bz = rz + uz * 0.004
 
-    # face_n = fwd × up ; n_v = normalize(face_n*0.6 + up*0.5)
-    fnx = dy * uz - dz * uy
-    fny = dz * ux - dx * uz
-    fnz = dx * uy - dy * ux
-    nvx = fnx * 0.6 + ux * 0.5
-    nvy = fny * 0.6 + uy * 0.5
-    nvz = fnz * 0.6 + uz * 0.5
-    nl = math.sqrt(nvx * nvx + nvy * nvy + nvz * nvz)
-    if nl > 1e-9:
-        nvx, nvy, nvz = nvx / nl, nvy / nl, nvz / nl
-
+    flex = 0.60 + 0.50 * rng.random()
+    phase = rng.random() * 6.2831853 + (rx + ry) * 0.6
     shade = 0.80 + 0.40 * rng.random()
     t0, t1, t2 = tint
-    c0r, c0g, c0b = t0 * 0.50 * shade, t1 * 0.52 * shade, t2 * 0.50 * shade
-    c1r, c1g, c1b = t0 * 0.90 * shade, t1 * 0.92 * shade, t2 * 0.85 * shade
-    c2r = min(1.0, t0 * 1.12) * shade
-    c2g = min(1.0, t1 * 1.16) * shade
-    c2b = min(1.0, t2 * 0.95) * shade
-    flex = 0.60 + 0.50 * rng.random()
-    phase = rng.random() * 6.2831853 + (root.x() + root.y()) * 0.6
 
-    hl = wid * 0.5
-    blx, bly, blz = bx - wx * hl, by - wy * hl, bz - wz * hl
-    brx, bry, brz = bx + wx * hl, by + wy * hl, bz + wz * hl
-    mh = h * 0.55
-    ml = lean * 0.30
-    mwx, mwy, mwz = bx + ux * mh + dx * ml, by + uy * mh + dy * ml, bz + uz * mh + dz * ml
-    m2 = wid * 0.30
-    mlx, mly, mlz = mwx - wx * m2, mwy - wy * m2, mwz - wz * m2
-    mrx, mry, mrz = mwx + wx * m2, mwy + wy * m2, mwz + wz * m2
-    tipx, tipy, tipz = bx + ux * h + dx * lean, by + uy * h + dy * lean, bz + uz * h + dz * lean
+    # bend = fwd * lean: la plantilla sólo tiene que aportar la fracción z.
+    bdx = wxf * lean
+    bdy = wyf * lean
+    bdz = wzf * lean
 
-    nx, ny, nz = nvx, nvy, nvz
     buf.extend((
-        blx, bly, blz, nx, ny, nz, c0r, c0g, c0b, 0.0, phase, flex, h,
-        brx, bry, brz, nx, ny, nz, c0r, c0g, c0b, 0.0, phase, flex, h,
-        mrx, mry, mrz, nx, ny, nz, c1r, c1g, c1b, 0.55, phase, flex, h,
-        blx, bly, blz, nx, ny, nz, c0r, c0g, c0b, 0.0, phase, flex, h,
-        mrx, mry, mrz, nx, ny, nz, c1r, c1g, c1b, 0.55, phase, flex, h,
-        mlx, mly, mlz, nx, ny, nz, c1r, c1g, c1b, 0.55, phase, flex, h,
-        mlx, mly, mlz, nx, ny, nz, c1r, c1g, c1b, 0.55, phase, flex, h,
-        mrx, mry, mrz, nx, ny, nz, c1r, c1g, c1b, 0.55, phase, flex, h,
-        tipx, tipy, tipz, nx, ny, nz, c2r, c2g, c2b, 1.0, phase, flex, h,
+        bx, by, bz,
+        ux, uy, uz,
+        wxs, wys, wzs,
+        bdx, bdy, bdz,
+        h, wid, flex, phase,
+        t0 * shade, t1 * shade, t2 * shade,
     ))
 
 
-def build_grass_geometry(faces, density: float, max_blades: int,
-                         seed: int = 12345):
-    """Siembra hojas 3D sobre las caras de césped.
+def blade_template() -> bytes:
+    """Plantilla de hoja (9 vértices: pos + gradiente de color + t).
+
+    Local: ``x`` ancho (±0.5 base, ±0.30 medio), ``y`` alto (0…1), ``z``
+    curvatura (0…1). Los colores son el degradado base→media→punta."""
+    base, mid, tip = BLADE_GRADIENT
+    bl = (-0.5, 0.0, 0.0) + base + (0.0,)
+    br = (0.5, 0.0, 0.0) + base + (0.0,)
+    mr = (0.30, 0.55, 0.30) + mid + (0.55,)
+    ml = (-0.30, 0.55, 0.30) + mid + (0.55,)
+    tp = (0.0, 1.0, 1.0) + tip + (1.0,)
+    data = array("f")
+    for v in (bl, br, mr, bl, mr, ml, ml, mr, tp):
+        data.extend(v)
+    return data.tobytes()
+
+
+#: Plantilla de hoja lista para subir a la GPU.
+_BLADE_TEMPLATE = blade_template()
+
+
+def build_grass_instances(faces, density: float, max_blades: int,
+                          seed: int = 12345):
+    """Siembra instancias de hoja 3D sobre las caras de césped.
 
     ``faces`` es la lista que arma ``build_world_geometry`` (triángulos en
-    mundo + textura + color). Devuelve ``(bytes, vcount)`` listos para subir
-    a la GPU. Determinista por ``seed`` para que el césped no cambie de sitio
-    al reconstruir la escena por cambios ajenos."""
+    mundo + textura + color). Devuelve ``(bytes, count)`` con ``count``
+    instancias de ``GRASS_INST_STRIDE`` bytes listas para subir a la GPU.
+    Determinista por ``seed`` para que el césped no cambie de sitio al
+    reconstruir la escena por cambios ajenos."""
     data = array("f")
     if not faces or density <= 0.0:
         return data, 0
 
-    # Reúne todos los triángulos con su color de hoja y calcula áreas.
-    tris = []          # (p0, p1, p2, tint)
+    # Reúne los triángulos con su color de hoja y calcula áreas. Cada triángulo
+    # guarda su marco en ``float`` sueltos (origen, dos aristas y normal ya
+    # normalizada) para que el bucle de siembra no cree objetos QVector3D.
+    tris = []          # (ox,oy,oz, ax,ay,az, bx,by,bz, nx,ny,nz, t0,t1,t2)
     cum = []
     total = 0.0
     for tlist, texpath, facecol in faces:
@@ -1215,42 +1272,46 @@ def build_grass_geometry(faces, density: float, max_blades: int,
                     tint[2] * facecol[2])
         for tri in tlist:
             p0, p1, p2 = tri
-            area = 0.5 * QVector3D.crossProduct(p1 - p0, p2 - p0).length()
-            if area <= 1e-9:
+            ax = p1.x() - p0.x(); ay = p1.y() - p0.y(); az = p1.z() - p0.z()
+            bx = p2.x() - p0.x(); by = p2.y() - p0.y(); bz = p2.z() - p0.z()
+            cx = ay * bz - az * by
+            cy = az * bx - ax * bz
+            cz = ax * by - ay * bx
+            cl = math.sqrt(cx * cx + cy * cy + cz * cz)
+            if cl <= 2e-9:
                 continue
+            area = 0.5 * cl
             total += area
-            tris.append((p0, p1, p2, tint))
+            tris.append((p0.x(), p0.y(), p0.z(), ax, ay, az, bx, by, bz,
+                         cx / cl, cy / cl, cz / cl,
+                         tint[0], tint[1], tint[2]))
             cum.append(total)
     if total <= 0.0 or not tris:
         return data, 0
 
-    n_blades = int(min(float(max_blades), density * total))
-    if n_blades <= 0:
+    n = int(min(float(max_blades), density * total))
+    if n <= 0:
         return data, 0
 
     rng = random.Random(seed)
     last = len(tris) - 1
-    for _ in range(n_blades):
+    for _ in range(n):
         r = rng.random() * total
         j = bisect_left(cum, r)
         if j < 0:
             j = 0
         elif j > last:
             j = last
-        p0, p1, p2, tint = tris[j]
+        (ox, oy, oz, ax, ay, az, bx, by, bz, nx, ny, nz, t0, t1, t2) = tris[j]
         u = rng.random()
         v = rng.random()
         if u + v > 1.0:
             u = 1.0 - u
             v = 1.0 - v
-        root = p0 + (p1 - p0) * u + (p2 - p0) * v
-        n = QVector3D.crossProduct(p1 - p0, p2 - p0)
-        ln = n.length()
-        n = (n / ln) if ln > 1e-9 else QVector3D(0.0, 0.0, 1.0)
-        _emit_blade(data, root, n, tint, rng)
+        _emit_instance(data, ox + ax * u + bx * v, oy + ay * u + by * v,
+                       oz + az * u + bz * v, nx, ny, nz, (t0, t1, t2), rng)
 
-    vcount = len(data) // (G_STRIDE // 4)
-    return data, vcount
+    return data, len(data) // (GRASS_INST_STRIDE // 4)
 
 
 def build_world_geometry(scene) -> WorldGeometry:
@@ -1348,8 +1409,10 @@ def build_world_geometry(scene) -> WorldGeometry:
             else:
                 bump = 0.0
             grass = _is_grass(texpath, matname)
-            if grass:
-                bump = 0.0        # el césped 3D ya da el detalle
+            if grass and bump > 0.0:
+                # El césped 3D da el detalle de cerca; de lejos el terreno hace
+                # de impostor, así que le dejamos un relieve suave.
+                bump = min(bump, 0.35)
             key = (texpath, round(rough, 3), round(metal, 3),
                    round(trans, 3), round(opacity, 3), round(bump, 2))
             bucket = _bucket(key, texpath)
@@ -1483,7 +1546,8 @@ class WorldView(QOpenGLWidget):
         self._empty_vao = None
         self._vbo = None
         self._gvao = None
-        self._gvbo = None
+        self._gtmpl_vbo = None
+        self._ginst_vbo = None
         self._shadow_fbo = None
         self._scene_fbo = None
         self._ao_fbo = None
@@ -1505,6 +1569,9 @@ class WorldView(QOpenGLWidget):
         self._runs: list[_DrawRun] = []
         self._vcount = 0
         self._gcount = 0
+        self._geo = None            # última geometría construida (para el césped)
+        self._inst_ok = False       # ¿soporta el contexto GPU instancing?
+        self._grass_dirty = False   # sólo hay que rearmar el césped
         self._time = 0.0
         self._built_version = None
         self._dirty = True
@@ -1520,7 +1587,7 @@ class WorldView(QOpenGLWidget):
         self.shadow_strength = 0.62
         self.grass = True
         self.wind = True
-        self.grass_density = 45.0
+        self.grass_density = 500.0
         self.env = 0.40           # intensidad de reflejos de entorno
         self.floor_gloss = 0.35   # pisos hacia arriba pulidos
         self.bump = 1.0           # multiplicador global de relieve
@@ -1551,6 +1618,11 @@ class WorldView(QOpenGLWidget):
     def mark_dirty(self) -> None:
         self._dirty = True
 
+    def mark_grass_dirty(self) -> None:
+        """Sólo hay que resembrar el césped (cambió la densidad), sin rehacer
+        la geometría del modelo."""
+        self._grass_dirty = True
+
     def _tick(self) -> None:
         if not self.isVisible():
             return
@@ -1558,8 +1630,8 @@ class WorldView(QOpenGLWidget):
         moved = bool(self._keys) or self._looking
         if moved:
             self._apply_movement()
-        animate = self.wind and self._gcount > 0
-        if moved or self._dirty or animate:
+        animate = self.grass and self.wind and self._gcount > 0
+        if moved or self._dirty or self._grass_dirty or animate:
             self.update()
 
     def _apply_movement(self) -> None:
@@ -1606,6 +1678,12 @@ class WorldView(QOpenGLWidget):
         if self._gl is None:
             self._gl = QOpenGLFunctions(self.context())
             self._gl.initializeOpenGLFunctions()
+        # GPU instancing (GL 3.3): imprescindible para el césped 3D.
+        self._inst_ok = bool(hasattr(self._gl, "glDrawArraysInstanced")
+                             and hasattr(self._gl, "glVertexAttribDivisor"))
+        if not self._inst_ok:
+            log.warning("ViReal: el contexto no soporta instancing; "
+                        "césped 3D desactivado")
         self._prog = self._compile(_VERT, _FRAG, "principal")
         self._sky = self._compile(_SKY_VERT, _SKY_FRAG, "cielo")
         self._depth = self._compile(_DEPTH_VERT, _DEPTH_FRAG, "sombras")
@@ -1631,8 +1709,10 @@ class WorldView(QOpenGLWidget):
         self._vbo.create()
         self._gvao = QOpenGLVertexArrayObject(self)
         self._gvao.create()
-        self._gvbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
-        self._gvbo.create()
+        self._gtmpl_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        self._gtmpl_vbo.create()
+        self._ginst_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        self._ginst_vbo.create()
         self._gl.glEnable(GL_DEPTH_TEST)
         self._gl.glDepthFunc(GL_LEQUAL)
         self._gl.glEnable(GL_MULTISAMPLE)
@@ -1748,10 +1828,12 @@ class WorldView(QOpenGLWidget):
             self._prog.release()
         self._vao.release()
         self._vbo.release()
-        self._upload_grass(geo)
+        self._geo = geo
+        self._grass_dirty = False
+        self._upload_grass()
         n_tex = len({r.texture for r in self._runs if r.texture})
-        blades = self._gcount // 9
-        extra = f" · {blades} hojas" if blades else ""
+        blades = self._gcount
+        extra = f" · {blades} hojas 3D" if blades else ""
         self._stats = (f"{geo.faces} caras · {self._vcount // 3} triángulos · "
                        f"{len(self._runs)} materiales · {n_tex} texturas{extra}")
         self._built_version = self._scene_version()
@@ -1761,38 +1843,64 @@ class WorldView(QOpenGLWidget):
             self._want_frame = False
             self.frame_scene()
 
-    def _upload_grass(self, geo) -> None:
-        """Siembra y sube el césped 3D (0 hojas si la densidad es 0).
+    def _upload_grass(self) -> None:
+        """Siembra y sube el césped 3D instanciado (0 hojas si densidad 0).
 
         Se construye siempre (aunque el césped esté oculto) para que el
-        interruptor sea instantáneo, sin rehacer toda la geometría."""
+        interruptor sea instantáneo, sin rehacer toda la geometría. Requiere
+        que la geometría del mundo ya esté construida (``self._geo``)."""
+        geo = self._geo
+        faces = geo.grass_faces if geo is not None else []
         density = max(0.0, float(self.grass_density))
-        data, gcount = build_grass_geometry(geo.grass_faces, density,
-                                            GRASS_MAX_BLADES)
+        if self._inst_ok:
+            data, gcount = build_grass_instances(faces, density,
+                                                 GRASS_MAX_BLADES)
+        else:
+            data, gcount = array("f"), 0
         self._gcount = gcount
         blob = data.tobytes()
-        self._gvbo.bind()
+
+        # VBO de instancias (una hoja por bloque).
+        self._ginst_vbo.bind()
         if blob:
             try:
-                self._gvbo.allocate(blob, len(blob))
+                self._ginst_vbo.allocate(blob, len(blob))
             except TypeError:
-                self._gvbo.allocate(blob)
+                self._ginst_vbo.allocate(blob)
         else:
             try:
-                self._gvbo.allocate(4)
+                self._ginst_vbo.allocate(4)
             except Exception:  # noqa: BLE001
                 pass
+
+        # VBO de la plantilla (9 vértices, estático).
+        self._gtmpl_vbo.bind()
+        self._gtmpl_vbo.allocate(_BLADE_TEMPLATE, len(_BLADE_TEMPLATE))
+
         self._gvao.bind()
-        if self._gprog is not None:
+        if self._gprog is not None and self._inst_ok:
             self._gprog.bind()
-            for loc, offset, size in ((0, G_POS, 3), (1, G_NRM, 3),
-                                      (2, G_COL, 3), (3, G_DATA, 4)):
+            # Atributos de la plantilla.
+            self._gtmpl_vbo.bind()
+            for loc, offset, size in ((0, GT_POS, 3), (1, GT_COL, 3),
+                                      (2, GT_T, 1)):
                 self._gprog.enableAttributeArray(loc)
                 self._gprog.setAttributeBuffer(loc, GL_FLOAT, offset, size,
-                                               G_STRIDE)
+                                               GT_STRIDE)
+            # Atributos por instancia (divisor 1).
+            self._ginst_vbo.bind()
+            for loc, offset, size in ((4, GI_ROOT, 3), (5, GI_UP, 3),
+                                      (6, GI_SIDE, 3), (7, GI_BEND, 3),
+                                      (8, GI_META, 4), (9, GI_TINT, 3)):
+                self._gprog.enableAttributeArray(loc)
+                self._gprog.setAttributeBuffer(loc, GL_FLOAT, offset, size,
+                                               GRASS_INST_STRIDE)
+            for loc in (4, 5, 6, 7, 8, 9):
+                self._gl.glVertexAttribDivisor(loc, 1)
             self._gprog.release()
         self._gvao.release()
-        self._gvbo.release()
+        self._ginst_vbo.release()
+        self._gtmpl_vbo.release()
 
     def _update_light(self) -> None:
         scene = getattr(self.app.viewport, "scene", None)
@@ -2030,6 +2138,9 @@ class WorldView(QOpenGLWidget):
             return
         if self._dirty or self._scene_version() != self._built_version:
             self._rebuild()
+        elif self._grass_dirty:
+            self._grass_dirty = False
+            self._upload_grass()
 
         gl = self._gl
         dpr = self._dpr()
@@ -2146,7 +2257,8 @@ class WorldView(QOpenGLWidget):
         self._prog.release()
 
     def _draw_grass(self, mvp, shadow_tex, use_shadow) -> None:
-        if not (self.grass and self._gcount and self._gprog is not None):
+        if not (self.grass and self._gcount and self._gprog is not None
+                and self._inst_ok):
             return
         gl = self._gl
         gprog = self._gprog
@@ -2164,10 +2276,17 @@ class WorldView(QOpenGLWidget):
         self._sv(gprog, self._lg, "u_wind_dir", QVector2D(wdx, wdy))
         self._sv(gprog, self._lg, "u_wind_strength",
                  WIND_STRENGTH if self.wind else 0.0)
+        # LOD por distancia: lejos, las hojas se pliegan y el terreno
+        # texturizado hace de impostor. El radio crece con la escena.
+        far = min(GRASS_LOD_FAR_MAX,
+                  max(GRASS_LOD_FAR, self._scene_radius * 1.1))
+        near = max(GRASS_LOD_NEAR, far * 0.55)
+        self._sv(gprog, self._lg, "u_lod", QVector2D(near, far))
         if shadow_tex:
             self._bind_tex(1, shadow_tex)
         self._gvao.bind()
-        gl.glDrawArrays(GL_TRIANGLES, 0, self._gcount)
+        gl.glDrawArraysInstanced(GL_TRIANGLES, 0, GRASS_TEMPLATE_VERTS,
+                                 self._gcount)
         self._gvao.release()
         gprog.release()
 
@@ -2466,8 +2585,9 @@ class WorldWindow(QDialog):
         self.chk_grass = QCheckBox("Césped 3D", row1)
         self.chk_grass.setChecked(True)
         self.chk_grass.setToolTip(
-            "Hojas 3D que se mecen con el viento sobre las superficies con "
-            "textura de césped/grass (tecla C)")
+            "Hojas 3D instanciadas en la GPU que se mecen con el viento sobre "
+            "las superficies con textura de césped/grass. De lejos el terreno "
+            "hace de impostor (LOD). (tecla C)")
         self.chk_grass.toggled.connect(self._on_grass)
         lay.addWidget(self.chk_grass)
 
@@ -2568,12 +2688,13 @@ class WorldWindow(QDialog):
 
         fx.addWidget(QLabel("Césped/m²", row2))
         self.spin_grass = QDoubleSpinBox(row2)
-        self.spin_grass.setRange(0.0, 200.0)
-        self.spin_grass.setSingleStep(5.0)
+        self.spin_grass.setRange(0.0, 2000.0)
+        self.spin_grass.setSingleStep(25.0)
         self.spin_grass.setDecimals(0)
-        self.spin_grass.setValue(45.0)
+        self.spin_grass.setValue(500.0)
         self.spin_grass.setToolTip("Densidad de hojas por metro cuadrado de "
-                                   "césped (0 = sin césped)")
+                                   "césped (0 = sin césped). Cuanto mayor, "
+                                   "más continuo el manto.")
         self.spin_grass.valueChanged.connect(self._on_density)
         fx.addWidget(self.spin_grass)
 
@@ -2603,7 +2724,7 @@ class WorldWindow(QDialog):
 
     def _on_density(self, v: float) -> None:
         self.view.grass_density = float(v)
-        self.view.mark_dirty()
+        self.view.mark_grass_dirty()
         self.view.update()
 
     def _on_ssr(self, on: bool) -> None:
@@ -2636,6 +2757,7 @@ class WorldWindow(QDialog):
 
     def _load_view_state(self) -> None:
         s = self.settings
+        prev_ver = str(s.value(_SETTINGS + "version", ""))
 
         def _flag(key, default=True):
             return str(s.value(_SETTINGS + key,
@@ -2649,7 +2771,12 @@ class WorldWindow(QDialog):
             self.view.grass = _flag("grass")
             self.view.wind = _flag("wind")
             self.view.grass_density = float(
-                s.value(_SETTINGS + "grass_density", 45.0))
+                s.value(_SETTINGS + "grass_density", 500.0))
+            # Migración 0.5.0: el césped pasó a instanciado; el 45/m² antiguo
+            # era el valor por defecto (no una elección), así que lo subimos
+            # una sola vez para que el manto se vea continuo.
+            if prev_ver < "0.5.0" and abs(self.view.grass_density - 45.0) < 1e-6:
+                self.view.grass_density = 500.0
             self.view.ssr = _flag("ssr")
             self.view.ssao = _flag("ssao")
             self.view.bloom = _flag("bloom")
@@ -2676,6 +2803,7 @@ class WorldWindow(QDialog):
 
     def save_view_state(self) -> None:
         s = self.settings
+        s.setValue(_SETTINGS + "version", __version__)
         s.setValue(_SETTINGS + "shadows", self.view.shadows)
         s.setValue(_SETTINGS + "exposure", self.view.exposure)
         s.setValue(_SETTINGS + "ambient", self.view.ambient)
@@ -2715,8 +2843,9 @@ class ViRealPanel(QWidget):
             "reales, cielo y luz solar físicos (el sol se enrojece y se apaga "
             "según su elevación real), sombras suaves, reflejos en tiempo real "
             "sobre pisos brillantes, vidrio y metal, relieve en piedras y "
-            "ladrillos, sombra ambiental y bloom. Césped 3D que se mece con "
-            "el viento en las superficies con textura de césped/grass, y "
+            "ladrillos, sombra ambiental y bloom. Césped 3D instanciado (manto "
+            "continuo con LOD) que se mece con el viento en las superficies con "
+            "textura de césped/grass, y "
             "paletas de cielo (día, atardecer, nublado, noche). Cámara libre "
             "tipo juego (W/A/S/D + ratón).", box)
         note.setWordWrap(True)
