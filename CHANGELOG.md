@@ -2,6 +2,38 @@
 
 Todas las fechas son en formato AAAA-MM-DD.
 
+## [0.6.1] — 2026-11-19
+
+### Corregido
+- Aterrizaje sobre suelos y colisión con figuras: el colisionador ahora lee
+  correctamente los tres vértices de cada triángulo del buffer de la escena.
+
+## [0.6.0] — 2026-11-19
+
+### Añadido
+- **Modo caminar** con gravedad y colisiones, Activado/desactivado con la
+  **barra espaciadora** o la casilla **Gravedad**. El observador cae, se apoya
+  sobre las superficies superiores y choca contra muebles y paredes; el
+  desplazamiento lateral se desliza sobre los obstáculos.
+- **Altura de la persona** ajustable (1,20–2,20 m, por defecto 1,75 m). Los
+  ojos se sitúan al **93%** de esa altura, acordes con las proporciones humanas.
+- Los escalones de hasta **0,28 m** se suben automáticamente; el cuerpo se
+  modela como un cilindro de **0,25 m** de radio.
+- Índice espacial de triángulos reconstruido con la escena para que las
+  consultas de suelo y colisión no recorran toda la malla.
+
+### Corregido
+- El avance continuo de la cámara cuando se perdía el `keyRelease` o el
+  `mouseRelease` (cambio de foco, ratón fuera de la vista): al perder el foco o
+  ocultarse la ventana se limpian las teclas y el arrastre.
+
+## [0.5.1] — 2026-11-19
+
+### Añadido
+- Selector **Arrastre** en la barra de la ventana para invertir la dirección
+  del ratón: **Normal**, **Invertir X**, **Invertir Y** o **Invertir X e Y**.
+  La elección se guarda en los ajustes de ViReal.
+
 ## [0.5.0] — 2026-10-16
 
 Césped **instanciado en la GPU** con **LOD por distancia**: el césped pasa de

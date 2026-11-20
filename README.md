@@ -113,10 +113,11 @@ Puedes abrir la ventana de dos formas:
 
 | Entrada            | Acción                                   |
 | ------------------ | ---------------------------------------- |
-| Arrastrar (ratón)  | Mirar alrededor                          |
+| Arrastrar (ratón)  | Mirar alrededor (dirección configurable en la barra: Normal / Invertir X / Invertir Y / Invertir X e Y) |
 | `W` / `A` / `S` / `D` | Moverse adelante / izquierda / atrás / derecha |
 | `Q` / `E`          | Bajar / subir                            |
 | `Shift`            | Correr                                   |
+| `Espacio`          | Activar / desactivar gravedad y colisiones (modo caminar) |
 | Rueda del ratón    | Acercar / alejar                         |
 | `R`                | Reencuadrar todo el modelo               |
 | `T`                | Activar / desactivar sombras             |
@@ -130,8 +131,10 @@ Puedes abrir la ventana de dos formas:
 
 En la barra superior de la ventana tienes botones para **Actualizar**,
 **Reencuadrar**, alternar **Sombras**, **Césped 3D**, **Viento**, **Reflejos**,
-**Oclusión** y ***Bloom***, elegir la **paleta de cielo** y ajustar
-**Exposición**, **Ambiente**, **densidad de césped** (hojas por m²; 0 lo
+**Oclusión** y ***Bloom***, elegir la **paleta de cielo**, invertir la
+**dirección del arrastre** del ratón (eje X, eje Y o ambos), activar la
+**Gravedad**, ajustar la **Altura** de la persona (los ojos quedan al 93%) y
+regular **Exposición**, **Ambiente**, **densidad de césped** (hojas por m²; 0 lo
 desactiva), **reflejos de entorno**, **brillo de pisos** y **relieve**.
 
 ---

@@ -105,7 +105,7 @@ from PySide6.QtWidgets import (
 log = logging.getLogger("ingetrazo.plugins.vireal")
 
 #: Versión de la extensión (coincide con el CHANGELOG y el paquete .zip).
-__version__ = "0.5.0"
+__version__ = "0.6.1"
 
 _SETTINGS = "vireal/"
 
@@ -259,6 +259,11 @@ BLADE_GRADIENT = ((0.50, 0.52, 0.50), (0.90, 0.92, 0.85), (1.12, 1.16, 0.95))
 #: Altura (m) y ancho (m) base de cada hoja de césped.
 GRASS_HEIGHT = 0.11
 GRASS_WIDTH = 0.014
+
+WALK_EYE_RATIO = 0.93
+WALK_BODY_RADIUS = 0.25
+WALK_STEP_HEIGHT = 0.28
+WALK_GRAVITY = 9.81
 
 #: Tope de hojas instanciadas por reconstrucción (una escena enorme no debe
 #: colgar la app). Con instancing el tope puede ser mucho más alto que antes.
@@ -1035,6 +1040,157 @@ class WorldGeometry:
         return not self.runs
 
 
+class WalkCollider:
+    __slots__ = ("tris", "cells", "large")
+
+    CELL = 2.0
+    MAX_CELLS = 256
+    EPS = 1e-4
+
+    def __init__(self, geo):
+        self.tris = []
+        self.cells = {}
+        self.large = []
+        arr = array("f")
+        try:
+            arr.frombytes(geo.data)
+        except Exception:
+            return
+        vert = V_STRIDE // 4
+        stride = vert * 3
+        for i in range(0, len(arr) - stride + 1, stride):
+            ax, ay, az = arr[i], arr[i + 1], arr[i + 2]
+            bx, by, bz = arr[i + vert], arr[i + vert + 1], arr[i + vert + 2]
+            cx, cy, cz = arr[i + 2 * vert], arr[i + 2 * vert + 1], \
+                arr[i + 2 * vert + 2]
+            ux, uy, uz = bx - ax, by - ay, bz - az
+            vx, vy, vz = cx - ax, cy - ay, cz - az
+            nx = uy * vz - uz * vy
+            ny = uz * vx - ux * vz
+            nz = ux * vy - uy * vx
+            ln = math.sqrt(nx * nx + ny * ny + nz * nz)
+            walkable = ln > 1e-9 and abs(nz) / ln > 0.55
+            idx = len(self.tris)
+            self.tris.append((ax, ay, az, bx, by, bz, cx, cy, cz,
+                              walkable, min(az, bz, cz), max(az, bz, cz)))
+            x0 = int(math.floor(min(ax, bx, cx) / self.CELL))
+            x1 = int(math.floor(max(ax, bx, cx) / self.CELL))
+            y0 = int(math.floor(min(ay, by, cy) / self.CELL))
+            y1 = int(math.floor(max(ay, by, cy) / self.CELL))
+            if (x1 - x0 + 1) * (y1 - y0 + 1) > self.MAX_CELLS:
+                self.large.append(idx)
+                continue
+            for ix in range(x0, x1 + 1):
+                for iy in range(y0, y1 + 1):
+                    self.cells.setdefault((ix, iy), []).append(idx)
+
+    def near(self, x, y, r=0.0):
+        x0 = int(math.floor((x - r) / self.CELL))
+        x1 = int(math.floor((x + r) / self.CELL))
+        y0 = int(math.floor((y - r) / self.CELL))
+        y1 = int(math.floor((y + r) / self.CELL))
+        seen = set()
+        out = []
+        for ix in range(x0, x1 + 1):
+            for iy in range(y0, y1 + 1):
+                for idx in self.cells.get((ix, iy), ()):
+                    if idx not in seen:
+                        seen.add(idx)
+                        out.append(self.tris[idx])
+        for idx in self.large:
+            out.append(self.tris[idx])
+        return out
+
+    def surface_z(self, x, y, zmin, zmax):
+        best = None
+        eps = self.EPS
+        for t in self.near(x, y):
+            ax, ay, az, bx, by, bz, cx, cy, cz, walk, zlo, zhi = t
+            if not walk or zhi < zmin - eps or zlo > zmax + eps:
+                continue
+            ux, uy = bx - ax, by - ay
+            vx, vy = cx - ax, cy - ay
+            d = ux * vy - uy * vx
+            if abs(d) < 1e-9:
+                continue
+            wx, wy = x - ax, y - ay
+            l1 = (wx * vy - wy * vx) / d
+            l2 = (ux * wy - uy * wx) / d
+            if l1 < -eps or l2 < -eps or l1 + l2 > 1.0 + eps:
+                continue
+            z = az + l1 * (bz - az) + l2 * (cz - az)
+            if z < zmin - eps or z > zmax + eps:
+                continue
+            if best is None or z > best:
+                best = z
+        return best
+
+    def support(self, x, y, zmin, zmax, radius):
+        best = None
+        d = radius * 0.65
+        for ox, oy in ((0.0, 0.0), (d, 0.0), (-d, 0.0),
+                       (0.0, d), (0.0, -d)):
+            z = self.surface_z(x + ox, y + oy, zmin, zmax)
+            if z is not None and (best is None or z > best):
+                best = z
+        return best
+
+    @staticmethod
+    def _dist2_seg(px, py, ax, ay, bx, by):
+        dx, dy = bx - ax, by - ay
+        l2 = dx * dx + dy * dy
+        if l2 < 1e-12:
+            return (px - ax) ** 2 + (py - ay) ** 2
+        t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / l2))
+        qx, qy = ax + t * dx - px, ay + t * dy - py
+        return qx * qx + qy * qy
+
+    def _dist2_xy(self, px, py, t):
+        ax, ay, az, bx, by, bz, cx, cy, cz, walk, zlo, zhi = t
+        ux, uy = bx - ax, by - ay
+        vx, vy = cx - ax, cy - ay
+        d = ux * vy - uy * vx
+        if abs(d) > 1e-12:
+            wx, wy = px - ax, py - ay
+            u = (wx * vy - wy * vx) / d
+            v = (ux * wy - uy * wx) / d
+            if u >= 0.0 and v >= 0.0 and u + v <= 1.0:
+                return 0.0
+        return min(self._dist2_seg(px, py, ax, ay, bx, by),
+                   self._dist2_seg(px, py, bx, by, cx, cy),
+                   self._dist2_seg(px, py, cx, cy, ax, ay))
+
+    def blocked(self, x, y, feet, height, radius, step_h):
+        bot = feet + 0.05
+        top = feet + height - 0.05
+        r2 = radius * radius
+        step = None
+        for t in self.near(x, y, radius):
+            ax, ay, az, bx, by, bz, cx, cy, cz, walk, zlo, zhi = t
+            if zhi < bot or zlo > top:
+                continue
+            if self._dist2_xy(x, y, t) >= r2:
+                continue
+            if walk and zhi <= feet + step_h and zlo <= feet + step_h:
+                if step is None or zhi > step:
+                    step = zhi
+            else:
+                return True, None
+        return False, step
+
+    def move(self, x, y, feet, dx, dy, height, radius, step_h):
+        blocked, step = self.blocked(x + dx, y + dy, feet, height,
+                                     radius, step_h)
+        if not blocked:
+            return x + dx, y + dy, step
+        b1, s1 = self.blocked(x + dx, y, feet, height, radius, step_h)
+        b2, s2 = self.blocked(x, y + dy, feet, height, radius, step_h)
+        nx = x if b1 else x + dx
+        ny = y if b2 else y + dy
+        steps = [s for s in (step, s1, s2) if s is not None]
+        return nx, ny, max(steps) if steps else None
+
+
 def _norm_words(text: str) -> str:
     """Minúsculas y sin acentos, para comparar con las palabras clave."""
     text = str(text).lower()
@@ -1598,6 +1754,11 @@ class WorldView(QOpenGLWidget):
         self.ao_strength = 0.55
         self.sky_preset = 0
         self.vignette = 0.30
+        self.mouse_invert = 0
+        self.walk = False
+        self.eye_height = 1.75
+        self._collider = None
+        self._walk_vz = 0.0
         self._shadow_dirty = True
 
         self._keys: set = set()
@@ -1627,12 +1788,17 @@ class WorldView(QOpenGLWidget):
         if not self.isVisible():
             return
         self._time = self._clock.elapsed() / 1000.0
-        moved = bool(self._keys) or self._looking
+        moved = bool(self._keys) or self._looking or self.walk
         if moved:
             self._apply_movement()
         animate = self.grass and self.wind and self._gcount > 0
         if moved or self._dirty or self._grass_dirty or animate:
             self.update()
+
+    def set_walk(self, on: bool) -> None:
+        self.walk = bool(on)
+        self._walk_vz = 0.0
+        self.update()
 
     def _apply_movement(self) -> None:
         now = self._clock.elapsed() / 1000.0
@@ -1645,18 +1811,66 @@ class WorldView(QOpenGLWidget):
         step = cam.speed * dt * sprint
         f = cam.forward()
         r = cam.right()
+        if not self.walk:
+            if Qt.Key_W in self._keys:
+                cam.pos = cam.pos + f * step
+            if Qt.Key_S in self._keys:
+                cam.pos = cam.pos - f * step
+            if Qt.Key_D in self._keys:
+                cam.pos = cam.pos + r * step
+            if Qt.Key_A in self._keys:
+                cam.pos = cam.pos - r * step
+            if Qt.Key_E in self._keys:
+                cam.pos = cam.pos + QVector3D(0.0, 0.0, step)
+            if Qt.Key_Q in self._keys:
+                cam.pos = cam.pos - QVector3D(0.0, 0.0, step)
+            return
+        if self._collider is None and self._geo is not None:
+            try:
+                self._collider = WalkCollider(self._geo)
+            except Exception:
+                log.exception("ViReal: falló el colisionador de caminata")
+                self.walk = False
+                return
+        if self._collider is None:
+            return
+        eye = self.eye_height * WALK_EYE_RATIO
+        feet = cam.pos.z() - eye
+        f = QVector3D(f.x(), f.y(), 0.0)
+        r = QVector3D(r.x(), r.y(), 0.0)
+        if f.lengthSquared() > 1e-9:
+            f = f.normalized()
+        if r.lengthSquared() > 1e-9:
+            r = r.normalized()
+        dx = dy = 0.0
         if Qt.Key_W in self._keys:
-            cam.pos = cam.pos + f * step
+            dx += f.x() * step
+            dy += f.y() * step
         if Qt.Key_S in self._keys:
-            cam.pos = cam.pos - f * step
+            dx -= f.x() * step
+            dy -= f.y() * step
         if Qt.Key_D in self._keys:
-            cam.pos = cam.pos + r * step
+            dx += r.x() * step
+            dy += r.y() * step
         if Qt.Key_A in self._keys:
-            cam.pos = cam.pos - r * step
-        if Qt.Key_E in self._keys:
-            cam.pos = cam.pos + QVector3D(0.0, 0.0, step)
-        if Qt.Key_Q in self._keys:
-            cam.pos = cam.pos - QVector3D(0.0, 0.0, step)
+            dx -= r.x() * step
+            dy -= r.y() * step
+        col = self._collider
+        nx, ny, stair = col.move(cam.pos.x(), cam.pos.y(), feet, dx, dy,
+                                 self.eye_height, WALK_BODY_RADIUS,
+                                 WALK_STEP_HEIGHT)
+        if stair is not None and stair > feet:
+            feet = stair
+            self._walk_vz = 0.0
+        self._walk_vz -= WALK_GRAVITY * dt
+        nz = feet + self._walk_vz * dt
+        land = col.support(nx, ny, nz - 0.05, feet + 0.05, WALK_BODY_RADIUS)
+        if land is not None and self._walk_vz <= 0.0:
+            feet = land
+            self._walk_vz = 0.0
+        else:
+            feet = nz
+        cam.pos = QVector3D(nx, ny, feet + eye)
 
     _mods = Qt.NoModifier
 
@@ -1829,6 +2043,7 @@ class WorldView(QOpenGLWidget):
         self._vao.release()
         self._vbo.release()
         self._geo = geo
+        self._collider = None
         self._grass_dirty = False
         self._upload_grass()
         n_tex = len({r.texture for r in self._runs if r.texture})
@@ -2432,7 +2647,8 @@ class WorldView(QOpenGLWidget):
             lines = [
                 "ViReal — ratón: mirar (arrastra) · W/A/S/D: mover · "
                 "Q/E: bajar/subir · rueda: acercar",
-                "Shift: correr · R: reencuadrar",
+                "Shift: correr · R: reencuadrar · Espacio: gravedad " +
+                ("ACTIVA (colisiones)" if self.walk else "inactiva (vuelo)"),
                 "T: sombras · C: césped · V: viento · F: reflejos · "
                 "G: oclusión · B: bloom · N: cielo",
             ]
@@ -2463,6 +2679,16 @@ class WorldView(QOpenGLWidget):
         k = ev.key()
         if k == Qt.Key_Escape:
             self.window().close()
+            return
+        if k == Qt.Key_Space:
+            if ev.isAutoRepeat():
+                return
+            self.set_walk(not self.walk)
+            chk = getattr(self.window(), "chk_walk", None)
+            if chk is not None and chk.isChecked() != self.walk:
+                chk.blockSignals(True)
+                chk.setChecked(self.walk)
+                chk.blockSignals(False)
             return
         if k == Qt.Key_R:
             self.frame_scene()
@@ -2515,7 +2741,24 @@ class WorldView(QOpenGLWidget):
         self._looking = False
         self.unsetCursor()
 
+    def _release_input(self) -> None:
+        self._keys.clear()
+        self._looking = False
+        self._mods = Qt.NoModifier
+        self.unsetCursor()
+
+    def focusOutEvent(self, ev) -> None:
+        self._release_input()
+        super().focusOutEvent(ev)
+
+    def hideEvent(self, ev) -> None:
+        self._release_input()
+        super().hideEvent(ev)
+
     def mouseMoveEvent(self, ev) -> None:
+        if self._looking and ev.buttons() == Qt.NoButton:
+            self._looking = False
+            self.unsetCursor()
         if not self._looking:
             return
         pos = ev.position().toPoint()
@@ -2523,8 +2766,10 @@ class WorldView(QOpenGLWidget):
         dy = pos.y() - self._last_mouse.y()
         self._last_mouse = pos
         cam = self.camera
-        cam.yaw += dx * 0.0032
-        cam.pitch -= dy * 0.0032
+        sx = -1 if self.mouse_invert & 1 else 1
+        sy = -1 if self.mouse_invert & 2 else 1
+        cam.yaw += dx * 0.0032 * sx
+        cam.pitch -= dy * 0.0032 * sy
         lim = math.radians(89.0)
         cam.pitch = max(-lim, min(lim, cam.pitch))
         self.update()
@@ -2541,7 +2786,7 @@ class WorldView(QOpenGLWidget):
 class WorldWindow(QDialog):
     def __init__(self, app) -> None:
         super().__init__(app.window)
-        self.setWindowTitle("ViReal — render en vivo")
+        self.setWindowTitle("ViReal — render en vivo " + __version__)
         self.setWindowFlag(Qt.Window, True)
         self.setModal(False)
         self.resize(1120, 720)
@@ -2576,6 +2821,16 @@ class WorldWindow(QDialog):
         btn_frame.clicked.connect(self.view.frame_scene)
         lay.addWidget(btn_refresh)
         lay.addWidget(btn_frame)
+
+        lay.addWidget(QLabel("Arrastre", row1))
+        self.cmb_mouse = QComboBox(row1)
+        self.cmb_mouse.addItems(("Normal", "Invertir X", "Invertir Y",
+                                 "Invertir X e Y"))
+        self.cmb_mouse.setToolTip(
+            "Invierte la dirección en la que gira la cámara al arrastrar "
+            "con el ratón")
+        self.cmb_mouse.currentIndexChanged.connect(self._on_mouse_invert)
+        lay.addWidget(self.cmb_mouse)
 
         self.chk_shadows = QCheckBox("Sombras", row1)
         self.chk_shadows.setChecked(True)
@@ -2626,6 +2881,23 @@ class WorldWindow(QDialog):
         fx = QHBoxLayout(row2)
         fx.setContentsMargins(0, 0, 0, 0)
         fx.setSpacing(8)
+
+        self.chk_walk = QCheckBox("Gravedad", row2)
+        self.chk_walk.setToolTip(
+            "Activa la caminata con gravedad y colisiones (barra espaciadora)")
+        self.chk_walk.toggled.connect(self._on_walk)
+        fx.addWidget(self.chk_walk)
+
+        fx.addWidget(QLabel("Altura", row2))
+        self.spin_height = QDoubleSpinBox(row2)
+        self.spin_height.setRange(1.20, 2.20)
+        self.spin_height.setSingleStep(0.05)
+        self.spin_height.setDecimals(2)
+        self.spin_height.setValue(1.75)
+        self.spin_height.setToolTip(
+            "Estatura de la persona (m). Los ojos quedan al 93% de este valor")
+        self.spin_height.valueChanged.connect(self._on_height)
+        fx.addWidget(self.spin_height)
 
         self.chk_ssr = QCheckBox("Reflejos", row2)
         self.chk_ssr.setChecked(True)
@@ -2722,6 +2994,24 @@ class WorldWindow(QDialog):
         self.view.wind = bool(on)
         self.view.update()
 
+    def _on_mouse_invert(self, idx: int) -> None:
+        self.view.mouse_invert = int(idx)
+
+    def _on_walk(self, on: bool) -> None:
+        self.view.set_walk(on)
+
+    def _on_height(self, v: float) -> None:
+        view = self.view
+        new = float(v)
+        if view.walk:
+            cam = view.camera
+            cam.pos = QVector3D(
+                cam.pos.x(), cam.pos.y(),
+                cam.pos.z() - view.eye_height * WALK_EYE_RATIO +
+                new * WALK_EYE_RATIO)
+        view.eye_height = new
+        view.update()
+
     def _on_density(self, v: float) -> None:
         self.view.grass_density = float(v)
         self.view.mark_grass_dirty()
@@ -2784,6 +3074,11 @@ class WorldWindow(QDialog):
             self.view.floor_gloss = float(s.value(_SETTINGS + "floor", 0.35))
             self.view.bump = float(s.value(_SETTINGS + "bump", 1.0))
             self.view.sky_preset = int(s.value(_SETTINGS + "sky", 0))
+            self.view.mouse_invert = int(
+                s.value(_SETTINGS + "mouse_invert", 0))
+            self.view.walk = _flag("walk", False)
+            self.view.eye_height = float(
+                s.value(_SETTINGS + "height", 1.75))
             self.chk_shadows.setChecked(self.view.shadows)
             self.spin_exp.setValue(self.view.exposure)
             self.spin_amb.setValue(self.view.ambient)
@@ -2798,6 +3093,11 @@ class WorldWindow(QDialog):
             self.spin_env.setValue(self.view.env)
             self.spin_floor.setValue(self.view.floor_gloss)
             self.spin_bump.setValue(self.view.bump)
+            self.cmb_mouse.setCurrentIndex(
+                max(0, min(self.cmb_mouse.count() - 1,
+                           self.view.mouse_invert)))
+            self.chk_walk.setChecked(self.view.walk)
+            self.spin_height.setValue(self.view.eye_height)
         except (TypeError, ValueError):
             pass
 
@@ -2817,6 +3117,9 @@ class WorldWindow(QDialog):
         s.setValue(_SETTINGS + "floor", self.view.floor_gloss)
         s.setValue(_SETTINGS + "bump", self.view.bump)
         s.setValue(_SETTINGS + "sky", self.view.sky_preset)
+        s.setValue(_SETTINGS + "mouse_invert", self.view.mouse_invert)
+        s.setValue(_SETTINGS + "walk", self.view.walk)
+        s.setValue(_SETTINGS + "height", self.view.eye_height)
         s.sync()
 
     def closeEvent(self, ev) -> None:
