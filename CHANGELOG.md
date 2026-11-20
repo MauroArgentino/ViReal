@@ -2,6 +2,56 @@
 
 Todas las fechas son en formato AAAA-MM-DD.
 
+## [0.6.6] — 2026-11-19
+
+### Corregido
+- La dirección del sol se compara cada frame con `shadows.when_utc(lon)`,
+  latitud, longitud y norte, así mover la hora en IngeTrazo actualiza
+  `_light_vp` y la sombra sin depender de `scene.version`.
+- La pasada de sombras fuerza `GL_DEPTH_TEST` y `glDepthMask(True)` antes de
+  limpiar y dibujar el mapa.
+- Las caras en sombra recuperan rebote: el ambiente difuso usa
+  `skyAmbient(N) + u_gnd_col`, con muestra HDRI opcional sobre la normal y un
+  factor `0.85`, en vez del `0.25` anterior que dejaba las caras casi negras.
+
+## [0.6.5] — 2026-11-19
+
+### Corregido
+- El mapa de sombras ahora tiene un búfer de profundidad real: se reemplazó
+  `NoAttachment` por `QOpenGLFramebufferObject.Depth` en `_ensure_shadow_fbo`.
+  Así el Z-buffer ordena muro y piso por distancia al sol en vez de por orden
+  de dibujo, y el muro vuelve a proyectar sombra sobre el piso.
+
+## [0.6.4] — 2026-11-19
+
+### Corregido
+- Relieve de juntas: se invirtió el signo de `gx` en el Sobel y se bajó la
+  intensidad de 2,5 a 1,4 para que el cemento claro no genere cordones.
+- Costura vertical del horizonte HDRI: el eje horizontal usa `GL_REPEAT` y el
+  vertical `GL_CLAMP_TO_EDGE`.
+- El horizonte HDRI también se refleja en pisos pulidos y vidrio: `_FRAG`
+  mezcla la misma muestra por la dirección reflejada `R`.
+
+## [0.6.3] — 2026-11-19
+
+### Corregido
+- El horizonte HDR aparecía invertido: se corrigió la orientación vertical de
+  la textura equirectangular.
+
+## [0.6.2] — 2026-11-19
+
+### Añadido
+- **Horizonte HDR**: si `grasslands_sunset_2k.hdr` está junto al plugin, se usa
+  como fondo cerca y debajo del horizonte; el cielo físico por encima se conserva.
+
+### Cambiado
+- Equilibrio de luz: el sol directo pasa de 3,4 a 7,0 y el relleno ambiental
+  del cielo se reduce al 25%, para evitar el aspecto quemado con exposiciones
+  altas. El brillo especular del entorno cae con el cuadrado de la rugosidad.
+- El **SSAO** se suaviza con dos pasadas separables antes de la composición.
+- Las texturas y los mapas de relieve usan **anisotropía 16×** para que los
+  pisos vistos en ángulo rasante conserven el detalle.
+
 ## [0.6.1] — 2026-11-19
 
 ### Corregido

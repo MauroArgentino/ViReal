@@ -105,7 +105,7 @@ from PySide6.QtWidgets import (
 log = logging.getLogger("ingetrazo.plugins.vireal")
 
 #: Versión de la extensión (coincide con el CHANGELOG y el paquete .zip).
-__version__ = "0.6.1"
+__version__ = "0.6.6"
 
 _SETTINGS = "vireal/"
 
@@ -144,6 +144,7 @@ GL_LINEAR = 0x2601
 GL_RGBA8 = 0x8058
 GL_RGBA16F = 0x881A
 GL_CLAMP_TO_EDGE = 0x812F
+GL_REPEAT = 0x2901
 GL_MULTISAMPLE = 0x809D
 GL_TEXTURE2 = 0x84C2
 GL_TEXTURE3 = 0x84C3
@@ -163,9 +164,11 @@ _MAIN_UNIFORMS = _ATMO_UNIFORMS + (
     "u_mvp", "u_cam", "u_shadow_strength", "u_light_vp",
     "u_shadow_enable", "u_shadow", "u_tex", "u_color", "u_opacity",
     "u_use_texture", "u_use_bump", "u_bump", "u_bump_strength",
-    "u_env", "u_floor_gloss",
+    "u_env", "u_floor_gloss", "u_hdr", "u_hdr_enable",
 )
-_SKY_UNIFORMS = _ATMO_UNIFORMS + ("u_inv_vp", "u_cam")
+_SKY_UNIFORMS = _ATMO_UNIFORMS + (
+    "u_inv_vp", "u_cam", "u_hdr", "u_hdr_enable",
+)
 _DEPTH_UNIFORMS = ("u_light_vp",)
 _GRASS_UNIFORMS = _ATMO_UNIFORMS + (
     "u_mvp", "u_cam", "u_shadow_enable", "u_shadow",
@@ -311,7 +314,7 @@ const vec3  ATMO_OD_R = vec3(0.045, 0.105, 0.180);
 const float ATMO_OD_M = 0.021;
 const float ATMO_G    = 0.760;   // asimetría Mie (hacia delante)
 const float ATMO_SKY  = 105.0;   // escala de la dispersión del cielo
-const float ATMO_SUN  = 3.4;     // radiancia del sol directo
+const float ATMO_SUN  = 7.0;     // radiancia del sol directo
 const float ATMO_DISC = 34.0;    // radiancia del disco solar
 const float ATMO_ANG  = 0.00465; // radio angular del sol (rad ≈ 0,27°)
 
@@ -351,7 +354,7 @@ vec3 skyScatter(vec3 dir) {
                  + vec3(ATMO_OD_M * u_mie) * atmoPhaseM(mu)) * (1.0 - attn);
     vec3 col = ATMO_SKY * u_sky_tint * sunT * insc + u_sky_floor * u_sky_tint;
     // Bajo el horizonte: rebote del suelo.
-    float below = smoothstep(0.0, -0.12, dir.z);
+    float below = 1.0 - smoothstep(-0.12, 0.0, dir.z);
     return mix(col, u_gnd_col, below);
 }
 
@@ -422,6 +425,8 @@ uniform sampler2D u_bump;    // normal-map derivado de la textura (relieve)
 uniform float u_bump_strength;
 uniform float u_env;         // intensidad de los reflejos de entorno (IBL)
 uniform float u_floor_gloss; // 0..1: vuelve las caras hacia arriba pulidas
+uniform sampler2D u_hdr;
+uniform int u_hdr_enable;
 uniform int u_shadow_enable;
 uniform sampler2D u_shadow;
 uniform mat4 u_light_vp;
@@ -491,6 +496,12 @@ float shadowFactor(vec3 wpos, float ndl) {
         lit += (uvz.z + dot(grad, off) - bias <= d) ? 1.0 : 0.0;
     }
     return mix(1.0, lit / 12.0, u_shadow_strength);
+}
+
+vec2 dirToEquirectUV(vec3 d) {
+    float u = atan(d.y, d.x) / (2.0 * ATMO_PI) + 0.5;
+    float v = asin(clamp(d.z, -1.0, 1.0)) / ATMO_PI + 0.5;
+    return vec2(u, clamp(v, 0.002, 0.998));
 }
 
 void main() {
@@ -563,16 +574,26 @@ void main() {
 
     // Ambiente: se integra el propio cielo muestreado alrededor de la normal
     // (IBL aproximado), así el relleno de sombra toma el color real del cielo.
-    vec3 amb = albedo * skyAmbient(N) * u_ambient;
+    vec3 envDiff = skyAmbient(N);
+    if (u_hdr_enable == 1) {
+        vec3 hdriN = texture(u_hdr, dirToEquirectUV(N)).rgb * 0.65;
+        envDiff = mix(envDiff, hdriN, 0.65);
+    }
+    vec3 amb = albedo * (envDiff + u_gnd_col * 0.25) * u_ambient * 0.85;
 
     // Reflejo del entorno: el mismo cielo que se ve de fondo, difuminado con
     // la rugosidad (se mezcla con el ambiente difuso).
     vec3 R = reflect(-V, N);
     vec3 env = skyRadiance(R);
+    if (u_hdr_enable == 1) {
+        vec3 hdri = texture(u_hdr, dirToEquirectUV(R)).rgb;
+        float horizon = 1.0 - smoothstep(-0.10, 0.18, R.z);
+        env = mix(env, hdri * 0.55, horizon);
+    }
     env = mix(skyAmbient(N), env, clamp(1.0 - rough * 1.6, 0.0, 1.0));
     float fres = pow(1.0 - ndv, 5.0);
     vec3 Fenv = F0 + (1.0 - F0) * fres;
-    vec3 ambientSpec = env * Fenv * (1.0 - rough) * u_env;
+    vec3 ambientSpec = env * Fenv * pow(1.0 - rough, 2.0) * u_env;
 
     vec3 col = direct + amb + ambientSpec;
 
@@ -604,17 +625,29 @@ _SKY_FRAG = """
 in vec2 v_ndc;
 uniform mat4 u_inv_vp;
 uniform vec3 u_cam;
+uniform sampler2D u_hdr;
+uniform int u_hdr_enable;
 """ + _ATMO_GLSL + """
 layout(location = 0) out vec4 out_color;
 layout(location = 1) out vec4 out_mat;
 layout(location = 2) out vec4 out_pos;
 
+vec2 dirToEquirectUV(vec3 d) {
+    float u = atan(d.y, d.x) / (2.0 * ATMO_PI) + 0.5;
+    float v = asin(clamp(d.z, -1.0, 1.0)) / ATMO_PI + 0.5;
+    return vec2(u, clamp(v, 0.002, 0.998));
+}
+
 void main() {
     vec4 far = u_inv_vp * vec4(v_ndc, 1.0, 1.0);
     vec3 dir = normalize(far.xyz / far.w - u_cam);
-    // Cielo físico (dispersión + disco solar) en HDR: el tonemap y el bloom
-    // se aplican en el post-proceso.
-    out_color = vec4(skyRadiance(dir), 1.0);
+    vec3 col = skyRadiance(dir);
+    if (u_hdr_enable == 1) {
+        vec3 hdri = texture(u_hdr, dirToEquirectUV(dir)).rgb;
+        float horizon = 1.0 - smoothstep(-0.10, 0.18, dir.z);
+        col = mix(col, hdri * 0.55, horizon);
+    }
+    out_color = vec4(col, 1.0);
     out_mat = vec4(0.0);   // el cielo no tiene normal: se salta SSR/SSAO
     out_pos = vec4(0.0);
 }
@@ -771,7 +804,8 @@ void main() {
     float sh = grassShadow(v_world);
 
     vec3 direct = albedo * sunLight() * ndl * sh / 3.141593 * 1.25;
-    vec3 amb = albedo * skyAmbient(N) * u_ambient;
+    vec3 amb = albedo * (skyAmbient(N) + u_gnd_col * 0.35)
+             * u_ambient * 0.85;
     vec3 col = direct + amb;
     // Translucencia aproximada: las puntas dejan pasar algo de sol.
     col += albedo * sunLight() * 0.07 * v_t * sh;
@@ -1296,9 +1330,8 @@ def _build_normal_map(path, size: int = 256):
                         - (lum[ym][xp] + 2.0 * lum[y][xp] + lum[yp][xp])
                     gy = (lum[ym][xm] + 2.0 * lum[ym][x] + lum[ym][xp]) \
                         - (lum[yp][xm] + 2.0 * lum[yp][x] + lum[yp][xp])
-                    # Normal = normalize(-gx * k, -gy * k, 1).
-                    k = 2.5
-                    nx, ny, nz = -gx * k, -gy * k, 1.0
+                    k = 1.4
+                    nx, ny, nz = gx * k, -gy * k, 1.0
                     ln = math.sqrt(nx * nx + ny * ny + nz * nz) or 1.0
                     nx, ny, nz = nx / ln, ny / ln, nz / ln
                     r = int((nx * 0.5 + 0.5) * 255.0 + 0.5)
@@ -1310,6 +1343,84 @@ def _build_normal_map(path, size: int = 256):
         out = None
     _NORMAL_CACHE[path] = out
     return out
+
+
+def _read_rgbe(path: str):
+    """Lee un HDR Radiance (RGBE con RLE) a float32 lineal RGBA."""
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    head, sep, body = data.partition(b"\n\n")
+    if not sep or not head.startswith(b"#?RADIANCE"):
+        return None
+    dimline = body.split(b"\n", 1)[0]
+    parts = dimline.split()
+    if len(parts) != 4 or parts[0] not in (b"-Y", b"+Y"):
+        return None
+    try:
+        h, w = int(parts[1]), int(parts[3])
+    except ValueError:
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    pos = len(head) + 2 + len(dimline) + 1
+    out = array("f", [0.0]) * (w * h * 4)
+
+    def put(index, rgbe):
+        r, g, b, e = rgbe
+        j = index * 4
+        if e:
+            scale = math.ldexp(1.0, e - 136)
+            out[j] = (r + 0.5) * scale
+            out[j + 1] = (g + 0.5) * scale
+            out[j + 2] = (b + 0.5) * scale
+        out[j + 3] = 1.0
+
+    for y in range(h):
+        i = y * w
+        if (8 <= w <= 32767 and pos + 4 <= len(data)
+                and data[pos] == 2 and data[pos + 1] == 2):
+            sw = (data[pos + 2] << 8) | data[pos + 3]
+            if sw != w:
+                return None
+            pos += 4
+            channels = []
+            ok = True
+            for _ in range(4):
+                ch = bytearray()
+                while len(ch) < w:
+                    if pos >= len(data):
+                        ok = False
+                        break
+                    n = data[pos]
+                    pos += 1
+                    if n > 128:
+                        if pos >= len(data):
+                            ok = False
+                            break
+                        ch.extend(bytes((data[pos],)) * (n - 128))
+                        pos += 1
+                    else:
+                        if n == 0 or pos + n > len(data):
+                            ok = False
+                            break
+                        ch.extend(data[pos:pos + n])
+                        pos += n
+                if not ok:
+                    return None
+                channels.append(ch)
+            for x in range(w):
+                put(i + x, (channels[0][x], channels[1][x],
+                            channels[2][x], channels[3][x]))
+        else:
+            for x in range(w):
+                if pos + 4 > len(data):
+                    return None
+                put(i + x, data[pos:pos + 4])
+                pos += 4
+    return w, h, out
 
 
 def _emit_instance(buf, rx, ry, rz, nx, ny, nz, tint, rng) -> None:
@@ -1707,10 +1818,12 @@ class WorldView(QOpenGLWidget):
         self._shadow_fbo = None
         self._scene_fbo = None
         self._ao_fbo = None
+        self._ao_blur_fbo = None
         self._bloom_a = None
         self._bloom_b = None
         self._white_tex = None
         self._black_tex = None
+        self._hdr_tex = None
         self._fb_size = None
         self._textures: dict = {}
         self._normals: dict = {}
@@ -1760,6 +1873,7 @@ class WorldView(QOpenGLWidget):
         self._collider = None
         self._walk_vz = 0.0
         self._shadow_dirty = True
+        self._light_key = None
 
         self._keys: set = set()
         self._looking = False
@@ -1930,6 +2044,7 @@ class WorldView(QOpenGLWidget):
         self._gl.glEnable(GL_DEPTH_TEST)
         self._gl.glDepthFunc(GL_LEQUAL)
         self._gl.glEnable(GL_MULTISAMPLE)
+        self._hdr_tex = self._make_hdr_texture()
         self._set_camera_from_core()
         self._dirty = True
 
@@ -2117,6 +2232,25 @@ class WorldView(QOpenGLWidget):
         self._ginst_vbo.release()
         self._gtmpl_vbo.release()
 
+    def _current_light_key(self):
+        scene = getattr(self.app.viewport, "scene", None)
+        sh = getattr(scene, "shadows", None)
+        datum = getattr(scene, "georef", None)
+        lat = getattr(datum, "lat", None)
+        lon = getattr(datum, "lon", None)
+        north = getattr(datum, "north", 0.0)
+        when = None
+        if callable(getattr(sh, "when_utc", None)):
+            try:
+                when = sh.when_utc(lon)
+            except Exception:  # noqa: BLE001
+                when = None
+        return (lat, lon, north, when)
+
+    def _refresh_light(self) -> None:
+        if self._current_light_key() != self._light_key:
+            self._update_light()
+
     def _update_light(self) -> None:
         scene = getattr(self.app.viewport, "scene", None)
         d = QVector3D(0.35, 0.45, 0.82)
@@ -2170,13 +2304,14 @@ class WorldView(QOpenGLWidget):
         proj.ortho(-r, r, -r, r, r * 0.5, r * 3.5)
         self._light_vp = proj * view
         self._shadow_dirty = True
+        self._light_key = self._current_light_key()
 
     def _ensure_shadow_fbo(self):
         if self._shadow_fbo is not None:
             return self._shadow_fbo
         try:
             fmt = QOpenGLFramebufferObjectFormat()
-            fmt.setAttachment(QOpenGLFramebufferObject.NoAttachment)
+            fmt.setAttachment(QOpenGLFramebufferObject.Depth)
             fmt.setInternalTextureFormat(GL_RGBA8)
             fbo = QOpenGLFramebufferObject(SHADOW_SIZE, SHADOW_SIZE, fmt)
             if not fbo.isValid():
@@ -2202,6 +2337,7 @@ class WorldView(QOpenGLWidget):
         tex.setWrapMode(QOpenGLTexture.Repeat)
         tex.setMinificationFilter(QOpenGLTexture.LinearMipMapLinear)
         tex.setMagnificationFilter(QOpenGLTexture.Linear)
+        tex.setMaximumAnisotropy(16.0)
         self._textures[path] = tex
         return tex
 
@@ -2217,6 +2353,7 @@ class WorldView(QOpenGLWidget):
                 tex.setWrapMode(QOpenGLTexture.Repeat)
                 tex.setMinificationFilter(QOpenGLTexture.LinearMipMapLinear)
                 tex.setMagnificationFilter(QOpenGLTexture.Linear)
+                tex.setMaximumAnisotropy(16.0)
             except Exception:  # noqa: BLE001
                 tex = None
         self._normals[path] = tex
@@ -2228,6 +2365,53 @@ class WorldView(QOpenGLWidget):
         img = QImage(1, 1, QImage.Format_RGBA8888)
         img.fill(value)
         tex = QOpenGLTexture(img)
+        tex.setMinificationFilter(QOpenGLTexture.Linear)
+        tex.setMagnificationFilter(QOpenGLTexture.Linear)
+        return tex
+
+    def _make_hdr_texture(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "grasslands_sunset_2k.hdr")
+        if not os.path.isfile(path):
+            return None
+        img = _read_rgbe(path)
+        if img is None:
+            log.warning("ViReal: no pude leer el HDR del horizonte: %s", path)
+            return None
+        w, h, data = img
+        tex = None
+        try:
+            tex = QOpenGLTexture(QOpenGLTexture.Target2D)
+            tex.setSize(w, h)
+            tex.setFormat(QOpenGLTexture.RGBA32F)
+            tex.setMinificationFilter(QOpenGLTexture.Linear)
+            tex.setMagnificationFilter(QOpenGLTexture.Linear)
+            tex.setWrapMode(QOpenGLTexture.DirectionS, QOpenGLTexture.Repeat)
+            tex.setWrapMode(QOpenGLTexture.DirectionT,
+                            QOpenGLTexture.ClampToEdge)
+            if not tex.isCreated():
+                tex.create()
+            tex.allocateStorage(QOpenGLTexture.RGBA, QOpenGLTexture.Float)
+            tex.setData(QOpenGLTexture.RGBA, QOpenGLTexture.Float,
+                        data.tobytes())
+            return tex
+        except Exception:  # noqa: BLE001
+            log.warning("ViReal: HDR float no disponible; uso fallback 8 bits")
+            if tex is not None:
+                try:
+                    tex.destroy()
+                except Exception:  # noqa: BLE001
+                    pass
+        from PySide6.QtGui import QImage
+        raw = bytearray(w * h * 4)
+        for i in range(w * h):
+            j = i * 4
+            for c in range(3):
+                v = data[i * 4 + c]
+                raw[j + c] = int(255.0 * v / (1.0 + v)) if v > 0 else 0
+            raw[j + 3] = 255
+        img8 = QImage(bytes(raw), w, h, w * 4, QImage.Format_RGBA8888).copy()
+        tex = QOpenGLTexture(img8.mirrored())
         tex.setMinificationFilter(QOpenGLTexture.Linear)
         tex.setMagnificationFilter(QOpenGLTexture.Linear)
         return tex
@@ -2266,13 +2450,14 @@ class WorldView(QOpenGLWidget):
             except Exception:  # noqa: BLE001
                 pass
 
-    def _bind_tex(self, unit: int, gl_id: int) -> None:
+    def _bind_tex(self, unit: int, gl_id: int,
+                  wrap_s: int = GL_CLAMP_TO_EDGE) -> None:
         gl = self._gl
         gl.glActiveTexture(GL_TEXTURE0 + unit)
         gl.glBindTexture(GL_TEXTURE_2D, int(gl_id))
         gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
         gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap_s)
         gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
         gl.glActiveTexture(GL_TEXTURE0)
 
@@ -2303,6 +2488,7 @@ class WorldView(QOpenGLWidget):
             afmt = QOpenGLFramebufferObjectFormat()
             afmt.setAttachment(QOpenGLFramebufferObject.NoAttachment)
             self._ao_fbo = QOpenGLFramebufferObject(w, h, afmt)
+            self._ao_blur_fbo = QOpenGLFramebufferObject(w, h, afmt)
             hw, hh = max(1, w // 2), max(1, h // 2)
             bfmt = QOpenGLFramebufferObjectFormat()
             bfmt.setAttachment(QOpenGLFramebufferObject.NoAttachment)
@@ -2314,7 +2500,8 @@ class WorldView(QOpenGLWidget):
         return self._scene_fbo
 
     def _delete_targets(self) -> None:
-        for name in ("_scene_fbo", "_ao_fbo", "_bloom_a", "_bloom_b"):
+        for name in ("_scene_fbo", "_ao_fbo", "_ao_blur_fbo",
+                     "_bloom_a", "_bloom_b"):
             obj = getattr(self, name, None)
             if obj is not None:
                 try:
@@ -2335,6 +2522,8 @@ class WorldView(QOpenGLWidget):
         if self._shadow_dirty:
             fbo.bind()
             gl.glViewport(0, 0, SHADOW_SIZE, SHADOW_SIZE)
+            gl.glEnable(GL_DEPTH_TEST)
+            gl.glDepthMask(True)
             gl.glClearColor(1.0, 1.0, 1.0, 1.0)
             gl.glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
             self._depth.bind()
@@ -2356,6 +2545,7 @@ class WorldView(QOpenGLWidget):
         elif self._grass_dirty:
             self._grass_dirty = False
             self._upload_grass()
+        self._refresh_light()
 
         gl = self._gl
         dpr = self._dpr()
@@ -2409,6 +2599,11 @@ class WorldView(QOpenGLWidget):
         self._sv(self._sky, self._ls, "u_inv_vp", self._invert(mvp))
         self._sv(self._sky, self._ls, "u_cam", self.camera.pos)
         self._set_atmo(self._sky, self._ls)
+        self._sv(self._sky, self._ls, "u_hdr_enable",
+                 1 if self._hdr_tex is not None else 0)
+        if self._hdr_tex is not None:
+            self._bind_tex(0, self._hdr_tex.textureId(), wrap_s=GL_REPEAT)
+            self._sv(self._sky, self._ls, "u_hdr", 0)
         self._empty_vao.bind()
         gl.glDisable(GL_DEPTH_TEST)
         gl.glDrawArrays(GL_TRIANGLES, 0, 3)
@@ -2432,6 +2627,11 @@ class WorldView(QOpenGLWidget):
         self._sv(self._prog, self._lm, "u_shadow", 1)
         self._sv(self._prog, self._lm, "u_tex", 0)
         self._sv(self._prog, self._lm, "u_bump", 2)
+        self._sv(self._prog, self._lm, "u_hdr_enable",
+                 1 if self._hdr_tex is not None else 0)
+        if self._hdr_tex is not None:
+            self._bind_tex(3, self._hdr_tex.textureId(), wrap_s=GL_REPEAT)
+            self._sv(self._prog, self._lm, "u_hdr", 3)
         if shadow_tex:
             self._bind_tex(1, shadow_tex)
 
@@ -2533,6 +2733,25 @@ class WorldView(QOpenGLWidget):
         gl.glDrawArrays(GL_TRIANGLES, 0, 3)
         self._empty_vao.release()
         prog.release()
+
+        if self._blur is not None and self._ao_blur_fbo is not None:
+            blur = self._blur
+            bw, bh = self._ao_blur_fbo.width(), self._ao_blur_fbo.height()
+            self._empty_vao.bind()
+            blur.bind()
+            self._sv(blur, self._blocs, "u_tex", 0)
+            for src, dst, direction in ((ao, self._ao_blur_fbo, (1.0, 0.0)),
+                                        (self._ao_blur_fbo, ao, (0.0, 1.0))):
+                dst.bind()
+                self._draw_buffers((GL_COLOR_ATTACHMENT0,))
+                gl.glViewport(0, 0, bw, bh)
+                self._bind_tex(0, src.texture())
+                self._sv(blur, self._blocs, "u_dir",
+                         QVector2D(direction[0] / bw, direction[1] / bh))
+                gl.glDrawArrays(GL_TRIANGLES, 0, 3)
+            blur.release()
+            self._empty_vao.release()
+
         gl.glEnable(GL_DEPTH_TEST)
         ao.release()
         return ao.texture()

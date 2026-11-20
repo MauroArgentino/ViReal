@@ -34,9 +34,9 @@ pie** con la cámara libre, mientras sigues modelando.
   con la orientación de cada cara. El brillo especular se ensancha según el
   tamaño angular del sol, para reflejos suaves en vez de un punto duro.
 - **Motor HDR con *post-proceso***: la escena se dibuja en *float* (RGBA16F) y
-  se procesa en pasos separados — **SSAO** (oclusión ambiental),
-  ***bloom*** (halo del sol y luces) y **composición** con *tone mapping* ACES
-  y gamma.
+  se procesa en pasos separados — **SSAO** (oclusión ambiental, suavizado antes
+  de aplicarse), ***bloom*** (halo del sol y luces) y **composición** con
+  *tone mapping* ACES y gamma.
 - **Reflejos en tiempo real (SSR)**: los pisos brillantes, el vidrio y el metal
   reflejan lo que tienen alrededor, mezclado con Fresnel por ángulo de visión y
   por rugosidad. El *shader* de geometría refleja el **mismo cielo** que se ve
@@ -45,6 +45,8 @@ pie** con la cámara libre, mientras sigues modelando.
   *normal map* (Sobel sobre la luminancia) que da **relieve a piedras,
   ladrillos y revoques**; el césped recibe uno tenue (para que el terreno de
   impostor se lea como hierba) y las superficies lisas quedan sin relieve.
+  Tanto las texturas como los mapas usan **anisotropía 16×** para conservar el
+  detalle en ángulos rasantes.
 - **Materiales con brillo**: lee `core.materials`, `core.group` y
   `core.finish` (roughness, metalness, transmisión, IOR) y aplica un sombreado
   **PBR aproximado** (Cook-Torrance GGX + difusa Lambert + ambiente del cielo).
@@ -54,7 +56,9 @@ pie** con la cámara libre, mientras sigues modelando.
 - **Paletas de cielo**: día, atardecer, nublado y noche; sólo ajustan el *look*
   (tinte del sol y del cielo, turbidez, brillo base) sobre la base física.
 - **Cielo físico** con degradado atmosférico, horizonte y disco solar (no el
-  fondo gris del CAD), **tone mapping ACES** y corrección gamma.
+  fondo gris del CAD), **tone mapping ACES** y corrección gamma. Si el archivo
+  `grasslands_sunset_2k.hdr` está junto al plugin, se mezcla sólo en el
+  horizonte como fondo de gran angular.
 - **Césped 3D instanciado**: las superficies cuya textura o material se llame
   «césped»/«grass» (también pasto, hierba, lawn, turf, grama, sod…) reciben
   **cientos de miles de hojas instanciadas en la GPU** —con el verde medio de tu
