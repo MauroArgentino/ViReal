@@ -4,8 +4,7 @@
 
 .DESCRIPTION
     Genera dist/ingetrazo_vireal-<version>.zip con vireal.py, README.md,
-    CHANGELOG.md, LICENSE y el HDR del horizonte. El usuario final sólo
-    necesita copiar vireal.py y el HDR a su carpeta de plugins de IngeTrazo.
+    CHANGELOG.md, LICENSE, el HDR del horizonte y el visor Babylon.js.
 
 .PARAMETER Version
     Versión a empaquetar. Si se omite, se toma del ``__version__`` de
@@ -54,6 +53,10 @@ foreach ($f in @("README.md", "LICENSE", "CHANGELOG.md",
     $p = Join-Path $root $f
     if (Test-Path $p) { Copy-Item $p (Join-Path $stage $f) }
 }
+$babylon = Join-Path $root "babylon"
+if (Test-Path $babylon) {
+    Copy-Item $babylon (Join-Path $stage "babylon") -Recurse -Force
+}
 
 $zip = Join-Path $dist "ingetrazo_vireal-$Version.zip"
 if (Test-Path $zip) { Remove-Item $zip -Force }
@@ -81,6 +84,11 @@ if ($Install) {
         if (Test-Path $hdr) {
             Copy-Item $hdr (Join-Path $plugins "grasslands_sunset_2k.hdr") -Force
             Write-Host "Instalado HDR en: $plugins\grasslands_sunset_2k.hdr" -ForegroundColor Green
+        }
+        $babylonDst = Join-Path $plugins "babylon"
+        if (Test-Path $babylon) {
+            Copy-Item $babylon $babylonDst -Recurse -Force
+            Write-Host "Instalado visor Babylon en: $babylonDst" -ForegroundColor Green
         }
         Write-Host "Instalado en: $plugins\vireal.py" -ForegroundColor Green
         Write-Host "Reinicia IngeTrazo para cargarlo."

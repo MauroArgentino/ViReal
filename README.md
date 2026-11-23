@@ -196,6 +196,10 @@ ViReal no refleja el viewport: construye su propia escena leyendo el modelo.
 ```
 ingetrazo_vireal/
 ├── vireal.py        # la extensión (esto es lo que se instala)
+├── babylon/         # visor Babylon.js (beta)
+│   ├── index.html
+│   └── viewer.js
+├── grasslands_sunset_2k.hdr
 ├── README.md
 ├── LICENSE          # GPL-3.0-or-later
 ├── CHANGELOG.md
@@ -211,13 +215,29 @@ ingetrazo_vireal/
 ./build_zip.ps1 -Version 0.5.0
 ```
 
-Genera `dist/ingetrazo_vireal-0.5.0.zip` con `vireal.py`, `README.md`,
-`LICENSE` y `CHANGELOG.md`. El usuario final sólo necesita copiar `vireal.py`
-a su carpeta de plugins. Recuerda subir también `dist/` a la *release* de
-GitHub (o adjuntar el `.zip`).
+Genera `dist/ingetrazo_vireal-0.7.1.zip` con `vireal.py`, `README.md`,
+`LICENSE`, `CHANGELOG.md`, el HDR y la carpeta `babylon/`. El usuario final
+necesita copiar `vireal.py`, el HDR y `babylon/` a su carpeta de plugins.
+Recuerda subir también `dist/` a la *release* de GitHub (o adjuntar el `.zip`).
 
 > Si omites `-Version`, el script la lee automáticamente de `__version__` en
 > `vireal.py`.
+
+---
+
+## Visor Babylon.js (beta)
+
+El botón **Babylon (beta)** abre una segunda ventana con un canvas Babylon.js.
+La vista OpenGL sigue siendo el render principal; esta ventana exporta una
+copia comprimida de la geometría y las texturas visibles (hasta 24 000
+vértices) y las inyecta en la página mediante `QWebEngineView.runJavaScript`.
+Los PNG temporales se crean en `%TEMP%\vireal_babylon_*` y se borran al cerrar
+la ventana. Cerrarla también descarta el motor Babylon para liberar RAM.
+
+Requiere que IngeTrazo incluya `PySide6.QtWebEngineWidgets`. El motor Babylon
+y el mapa de entorno IBL se descargan desde sus URLs oficiales, así que esta
+ventana necesita conexión a internet. Si no está disponible, ilumina igual con
+luz hemisférica y el render OpenGL sigue funcionando igual.
 
 ---
 
@@ -249,6 +269,12 @@ GitHub (o adjuntar el `.zip`).
 
 [GNU General Public License v3.0 o posterior](LICENSE)
 (`GPL-3.0-or-later`).
+
+El HDR `grasslands_sunset_2k.hdr` **no es GPL**: es
+[Grasslands Sunset de Poly Haven](https://polyhaven.com/a/grasslands_sunset),
+bajo **CC0 1.0** (foto: Dimitrios Savva; procesado: Jarod Guest). Verificado
+por MD5 `e90aa885c6237866893a696e650f9cba` contra la API de Poly Haven. CC0
+no exige atribución, pero se incluye de cortesía.
 
 ## Autor
 

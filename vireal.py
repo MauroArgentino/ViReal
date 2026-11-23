@@ -59,14 +59,19 @@ Instalar: copiar este archivo en la carpeta de plugins
 """
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import math
 import os
 import random
+import shutil
+import struct
+import tempfile
 from array import array
 from bisect import bisect_left
 
-from PySide6.QtCore import QElapsedTimer, QPoint, QSettings, Qt, QTimer
+from PySide6.QtCore import QElapsedTimer, QPoint, QSettings, Qt, QTimer, QUrl
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -89,6 +94,12 @@ from PySide6.QtOpenGL import (
     QOpenGLVertexArrayObject,
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
+try:  # noqa: BLE001
+    from PySide6.QtWebEngineCore import QWebEngineSettings
+    from PySide6.QtWebEngineWidgets import QWebEngineView
+except Exception:  # noqa: BLE001
+    QWebEngineSettings = None
+    QWebEngineView = None
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -97,6 +108,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -105,7 +117,7 @@ from PySide6.QtWidgets import (
 log = logging.getLogger("ingetrazo.plugins.vireal")
 
 #: Versión de la extensión (coincide con el CHANGELOG y el paquete .zip).
-__version__ = "0.6.6"
+__version__ = "0.7.1"
 
 _SETTINGS = "vireal/"
 
@@ -2856,6 +2868,86 @@ class WorldView(QOpenGLWidget):
         self._sv(prog, locs, "u_sky_floor", floor)
         self._sv(prog, locs, "u_ambient", float(self.ambient))
 
+    @staticmethod
+    def _babylon_texture_url(path: str, tmpdir: str, index: int):
+        from PySide6.QtGui import QImage
+        img = QImage(path)
+        if img.isNull():
+            return None
+        if img.width() > 512 or img.height() > 512:
+            img = img.scaled(512, 512, Qt.KeepAspectRatio,
+                             Qt.SmoothTransformation)
+        out = os.path.join(tmpdir, "tex_%02d.png" % index)
+        if not img.save(out, "PNG"):
+            return None
+        return QUrl.fromLocalFile(out).toString()
+
+    def babylon_payload(self, tmpdir: str, max_vertices: int = 24000) -> dict:
+        geo = getattr(self, "_geo", None)
+        runs = []
+        used = 0
+        if geo is not None:
+            tex_cache = {}
+            tex_index = 0
+            limit = min(len(geo.data) // V_STRIDE, max_vertices)
+            for index, run in enumerate(self._runs):
+                count = min(run.count, max(0, limit - used))
+                count -= count % 3
+                if count <= 0:
+                    break
+                packed = array("f")
+                end = min(run.first + count, len(geo.data) // V_STRIDE)
+                for i in range(run.first, end):
+                    v = struct.unpack_from("<14f", geo.data, i * V_STRIDE)
+                    packed.extend((v[0], v[2], -v[1],
+                                   v[3], v[5], -v[4],
+                                   v[6], v[7],
+                                   v[8], v[9], v[10], 1.0))
+                tex = None
+                if run.texture:
+                    if run.texture not in tex_cache:
+                        tex_index += 1
+                        tex_cache[run.texture] = self._babylon_texture_url(
+                            run.texture, tmpdir, tex_index)
+                    tex = tex_cache[run.texture]
+                runs.append({
+                    "name": "mat_%02d" % index,
+                    "data": base64.b64encode(packed.tobytes()).decode("ascii"),
+                    "count": end - run.first,
+                    "rough": float(run.rough),
+                    "metal": float(run.metal),
+                    "trans": float(run.trans),
+                    "alpha": float(run.opacity),
+                    "texture": tex,
+                })
+                used += end - run.first
+
+        lo, hi = self._bounds if self._bounds is not None else (
+            QVector3D(-5.0, -5.0, 0.0), QVector3D(5.0, 5.0, 4.0))
+        center = [(lo.x() + hi.x()) * 0.5,
+                  (lo.z() + hi.z()) * 0.5,
+                  -(lo.y() + hi.y()) * 0.5]
+        radius = max(hi.x() - lo.x(), hi.y() - lo.y(),
+                     hi.z() - lo.z(), 2.0) * 0.9
+        sun_t, _sky_t, _gnd, _mie, floor = self._atmo()
+        stats = self._stats or ""
+        if geo is not None and used < self._vcount:
+            stats += " · Babylon: %d/%d vértices" % (used, self._vcount)
+        return {
+            "runs": runs,
+            "camera": {"center": center, "radius": float(radius)},
+            "sun": [self._sun_dir.x(), self._sun_dir.z(),
+                    -self._sun_dir.y()],
+            "sunColor": [min(1.0, max(0.0, sun_t.x())),
+                         min(1.0, max(0.0, sun_t.y())),
+                         min(1.0, max(0.0, sun_t.z()))],
+            "skyColor": [min(1.0, max(0.0, floor.x())),
+                         min(1.0, max(0.0, floor.y())),
+                         min(1.0, max(0.0, floor.z()))],
+            "ambient": float(self.ambient),
+            "stats": stats,
+        }
+
     def _draw_hud(self, w: int, h: int) -> None:
         try:
             p = QPainter(self)
@@ -2999,6 +3091,71 @@ class WorldView(QOpenGLWidget):
         self.update()
 
 
+class BabylonWindow(QDialog):
+    def __init__(self, view, owner=None) -> None:
+        super().__init__(view)
+        self.setWindowTitle("ViReal — Babylon.js (beta)")
+        self.setWindowFlag(Qt.Window, True)
+        self.setModal(False)
+        self.resize(1120, 720)
+        self._view = view
+        self._owner = owner
+        self._tmpdir = None
+        self._payload = None
+        self.browser = None
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        if QWebEngineView is None:
+            root.addWidget(QLabel(
+                "QtWebEngine no está disponible en esta instalación.\n"
+                "La vista Babylon requiere PySide6.QtWebEngineWidgets.", self))
+            return
+        self._tmpdir = tempfile.mkdtemp(prefix="vireal_babylon_")
+        self._payload = view.babylon_payload(self._tmpdir)
+        self.browser = QWebEngineView(self)
+        if QWebEngineSettings is not None:
+            try:
+                settings = self.browser.page().settings()
+                settings.setAttribute(
+                    QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
+                settings.setAttribute(
+                    QWebEngineSettings.LocalContentCanAccessFileUrls, True)
+            except Exception:  # noqa: BLE001
+                pass
+        root.addWidget(self.browser)
+        self.browser.loadFinished.connect(self._inject)
+        html = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "babylon", "index.html")
+        self.browser.load(QUrl.fromLocalFile(html))
+
+    def _inject(self, ok: bool) -> None:
+        if not ok or self._payload is None:
+            return
+        payload = self._payload
+        self._payload = None
+        js = "window.virealLoad(%s);" % json.dumps(
+            payload, ensure_ascii=False)
+        del payload
+        self.browser.page().runJavaScript(js)
+
+    def closeEvent(self, event) -> None:
+        if self.browser is not None:
+            try:
+                self.browser.page().runJavaScript(
+                    "window.virealEngine && window.virealEngine.dispose();")
+            except Exception:  # noqa: BLE001
+                pass
+            self.browser.stop()
+            self.browser.deleteLater()
+            self.browser = None
+        if self._tmpdir:
+            shutil.rmtree(self._tmpdir, ignore_errors=True)
+            self._tmpdir = None
+        if self._owner is not None:
+            self._owner._babylon_window = None
+        super().closeEvent(event)
+
+
 # ---------------------------------------------------------------------------
 # Ventana flotante
 # ---------------------------------------------------------------------------
@@ -3012,6 +3169,7 @@ class WorldWindow(QDialog):
         self.setSizeGripEnabled(True)
 
         self.view = WorldView(app, self)
+        self._babylon_window = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -3189,6 +3347,11 @@ class WorldWindow(QDialog):
         self.spin_grass.valueChanged.connect(self._on_density)
         fx.addWidget(self.spin_grass)
 
+        btn_babylon = QPushButton("Babylon (beta)", row2)
+        btn_babylon.setToolTip("Abre la misma escena en un visor Babylon.js")
+        btn_babylon.clicked.connect(self._on_babylon)
+        fx.addWidget(btn_babylon)
+
         fx.addStretch(1)
         outer.addWidget(row2)
         return bar
@@ -3196,6 +3359,17 @@ class WorldWindow(QDialog):
     def _on_shadows(self, on: bool) -> None:
         self.view.shadows = bool(on)
         self.view.update()
+
+    def _on_babylon(self) -> None:
+        if QWebEngineView is None:
+            QMessageBox.warning(
+                self, "ViReal — Babylon.js",
+                "Esta instalación no incluye PySide6.QtWebEngineWidgets.")
+            return
+        if self._babylon_window is None:
+            self._babylon_window = BabylonWindow(self.view, self)
+        self._babylon_window.show()
+        self._babylon_window.raise_()
 
     def _on_exposure(self, v: float) -> None:
         self.view.exposure = float(v)

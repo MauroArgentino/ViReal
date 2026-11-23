@@ -2,6 +2,26 @@
 
 Todas las fechas son en formato AAAA-MM-DD.
 
+## [0.7.1] — 2026-11-19
+
+### Cambiado
+- Visor Babylon más liviano: geometría enviada como `Float32Array` en base64,
+  texturas como archivos PNG temporales de 512 px (se borran al cerrar) y tope
+  de 24 000 vértices por escena.
+- Se libera el payload de Python justo después de inyectarlo en la página.
+- Iluminación del visor: IBL (`environmentSpecular.env`), hemisférica reforzada,
+  rebote desde abajo y sombras más suaves para que las caras sin sol directo
+  no queden negras.
+
+## [0.7.0] — 2026-11-19
+
+### Añadido
+- Visor **Babylon.js (beta)** dentro del plugin: botón **Babylon (beta)** en la
+  barra, ventana `QWebEngineView` y exportación de la geometría/texturas de
+  ViReal a la escena Babylon (`babylon/index.html`, `babylon/viewer.js`).
+- Requiere que la instalación incluya `PySide6.QtWebEngineWidgets`; la escena
+  se inyecta por `runJavaScript` y el motor Babylon se carga desde su CDN.
+
 ## [0.6.6] — 2026-11-19
 
 ### Corregido
