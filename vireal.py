@@ -201,6 +201,7 @@ _SSAO_UNIFORMS = (
 )
 _BRIGHT_UNIFORMS = ("u_tex", "u_threshold", "u_knee")
 _BLUR_UNIFORMS = ("u_tex", "u_dir", "u_texel")
+_AO_BLUR_UNIFORMS = ("u_tex", "u_pos", "u_dir", "u_depth_sigma")
 _COMPOSITE_UNIFORMS = (
     "u_color", "u_ao", "u_bloom", "u_spec", "u_pos", "u_mat", "u_cam", "u_view",
     "u_proj", "u_exposure", "u_ao_strength", "u_bloom_amount", "u_env",
@@ -962,7 +963,7 @@ uniform float u_bias;
 uniform float u_intensity;
 out vec4 fragColor;
 
-const vec3 KERNEL[16] = vec3[16](
+const vec3 KERNEL[24] = vec3[24](
     vec3(0.52, 0.13, 0.30), vec3(-0.41, 0.58, 0.22),
     vec3(0.17, -0.62, 0.35), vec3(-0.55, -0.20, 0.41),
     vec3(0.68, 0.42, 0.18), vec3(-0.28, 0.71, 0.29),
@@ -970,7 +971,11 @@ const vec3 KERNEL[16] = vec3[16](
     vec3(0.11, 0.25, 0.72), vec3(-0.19, -0.33, 0.58),
     vec3(0.45, 0.55, 0.44), vec3(-0.47, 0.40, 0.50),
     vec3(0.60, -0.15, 0.28), vec3(-0.08, 0.52, 0.63),
-    vec3(0.24, -0.66, 0.30), vec3(-0.33, -0.50, 0.46)
+    vec3(0.24, -0.66, 0.30), vec3(-0.33, -0.50, 0.46),
+    vec3(0.07, 0.78, 0.62), vec3(-0.72, -0.28, 0.63),
+    vec3(0.38, 0.19, 0.90), vec3(-0.14, -0.75, 0.65),
+    vec3(0.81, -0.36, 0.46), vec3(-0.58, 0.63, 0.51),
+    vec3(0.29, -0.12, 0.95), vec3(-0.36, 0.44, 0.82)
 );
 
 float viewDepth(vec3 w) {
@@ -1000,7 +1005,9 @@ void main() {
 
     float pz = viewDepth(P);
     float occl = 0.0;
-    for (int i = 0; i < 16; i++) {
+    float valid = 0.0;
+    float soft = max(u_bias * 3.0, u_radius * 0.18);
+    for (int i = 0; i < 24; i++) {
         vec3 sp = P + TBN * (KERNEL[i] * u_radius);
         vec4 clip = u_proj * u_view * vec4(sp, 1.0);
         if (clip.w <= 0.0) continue;
@@ -1013,9 +1020,10 @@ void main() {
         float sz = viewDepth(smp.xyz);
         float sz2 = viewDepth(sp);
         float rangeCheck = smoothstep(0.0, 1.0, u_radius / max(abs(pz - sz), 1e-4));
-        occl += (sz <= sz2 - u_bias) ? rangeCheck : 0.0;
+        occl += smoothstep(0.0, soft, sz2 - u_bias - sz) * rangeCheck;
+        valid += 1.0;
     }
-    float ao = clamp(1.0 - occl / 16.0 * u_intensity, 0.0, 1.0);
+    float ao = clamp(1.0 - occl / max(valid, 1.0) * u_intensity, 0.0, 1.0);
     fragColor = vec4(ao, ao, ao, 1.0);
 }
 """
@@ -1052,6 +1060,39 @@ void main() {
 }
 """
 
+_AO_BLUR_FRAG = """
+#version 330 core
+in vec2 v_uv;
+uniform sampler2D u_tex;
+uniform sampler2D u_pos;
+uniform vec2 u_dir;
+uniform float u_depth_sigma;
+out vec4 fragColor;
+
+float depthWeight(vec3 p, vec3 q) {
+    if (length(p) < 1e-4 || length(q) < 1e-4) return 0.0;
+    return exp(-length(p - q) / max(u_depth_sigma, 1e-3));
+}
+
+void main() {
+    vec3 P = texture(u_pos, v_uv).xyz;
+    float w[5] = float[5](0.227027, 0.194594, 0.121621, 0.054054, 0.016216);
+    float sum = texture(u_tex, v_uv).r * w[0];
+    float wsum = w[0];
+    for (int i = 1; i < 5; i++) {
+        vec2 up = v_uv + u_dir * float(i);
+        vec2 um = v_uv - u_dir * float(i);
+        float wp = w[i] * depthWeight(P, texture(u_pos, up).xyz);
+        float wm = w[i] * depthWeight(P, texture(u_pos, um).xyz);
+        sum += texture(u_tex, up).r * wp;
+        sum += texture(u_tex, um).r * wm;
+        wsum += wp + wm;
+    }
+    float ao = clamp(sum / max(wsum, 1e-4), 0.0, 1.0);
+    fragColor = vec4(ao, ao, ao, 1.0);
+}
+"""
+
 _COMPOSITE_FRAG = """
 #version 330 core
 in vec2 v_uv;
@@ -1084,20 +1125,25 @@ vec3 aces(vec3 x) {
 float reflectionOcclusion(vec3 P, vec3 R) {
     vec3 ray = P + R * 0.10;
     float stride = max(0.05, length(P - u_cam) * 0.008);
+    float visibility = 1.0;
+    float edgeFade = 1.0;
     for (int i = 0; i < 24; i++) {
         ray += R * stride;
         vec4 clip = u_proj * u_view * vec4(ray, 1.0);
         if (clip.w <= 0.0) break;
         vec2 uv = clip.xy / clip.w * 0.5 + 0.5;
         if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) break;
+        edgeFade = smoothstep(0.0, 0.10, uv.x) * (1.0 - smoothstep(0.90, 1.0, uv.x))
+                 * smoothstep(0.0, 0.10, uv.y) * (1.0 - smoothstep(0.90, 1.0, uv.y));
         vec3 sp = texture(u_pos, uv).xyz;
         if (length(sp) > 1e-4) {
             float tol = 0.06 * (1.0 + float(i) * 0.05);
-            if (length(sp - ray) < tol) return 0.0;
+            float d = length(sp - ray) / max(tol, 1e-4);
+            visibility = min(visibility, smoothstep(0.25, 1.0, d));
         }
         stride *= 1.10;
     }
-    return 1.0;
+    return mix(1.0, visibility, edgeFade);
 }
 
 void main() {
@@ -1964,6 +2010,7 @@ class WorldView(QOpenGLWidget):
         self._depth = None
         self._gprog = None
         self._ssao = None
+        self._ao_blur = None
         self._bright = None
         self._blur = None
         self._comp = None
@@ -1990,6 +2037,7 @@ class WorldView(QOpenGLWidget):
         self._ld: dict = {}
         self._lg: dict = {}
         self._lo: dict = {}
+        self._aobloc: dict = {}
         self._lb: dict = {}
         self._lc: dict = {}
         self._blocs: dict = {}
@@ -2227,6 +2275,7 @@ class WorldView(QOpenGLWidget):
         self._depth = self._compile(_DEPTH_VERT, _DEPTH_FRAG, "sombras")
         self._gprog = self._compile(_GRASS_VERT, _GRASS_FRAG, "césped")
         self._ssao = self._compile(_FS_VERT, _SSAO_FRAG, "ssao")
+        self._ao_blur = self._compile(_FS_VERT, _AO_BLUR_FRAG, "ao-desenfoque")
         self._bright = self._compile(_FS_VERT, _BRIGHT_FRAG, "bloom-brillo")
         self._blur = self._compile(_FS_VERT, _BLUR_FRAG, "bloom-desenfoque")
         self._comp = self._compile(_FS_VERT, _COMPOSITE_FRAG, "compuesto")
@@ -2235,6 +2284,8 @@ class WorldView(QOpenGLWidget):
         self._ld = self._locs_for(self._depth, _DEPTH_UNIFORMS) if self._depth else {}
         self._lg = self._locs_for(self._gprog, _GRASS_UNIFORMS) if self._gprog else {}
         self._lo = self._locs_for(self._ssao, _SSAO_UNIFORMS) if self._ssao else {}
+        self._aobloc = self._locs_for(self._ao_blur, _AO_BLUR_UNIFORMS) \
+            if self._ao_blur else {}
         self._lb = self._locs_for(self._bright, _BRIGHT_UNIFORMS) if self._bright else {}
         self._lc = self._locs_for(self._comp, _COMPOSITE_UNIFORMS) if self._comp else {}
         self._blocs = self._locs_for(self._blur, _BLUR_UNIFORMS) \
@@ -2939,8 +2990,10 @@ class WorldView(QOpenGLWidget):
         """Sombra ambiental (SSAO). Devuelve el id de textura con el AO."""
         gl = self._gl
         if not (self.ssao and self._mrt and self._ssao is not None
-                and self._ao_fbo is not None and len(texs) >= 3):
+                and self._ao_blur is not None and self._ao_fbo is not None
+                and len(texs) >= 3):
             return 0
+        radius = max(0.08, self._scene_radius * 0.012)
         ao = self._ao_fbo
         ao.bind()
         self._draw_buffers((GL_COLOR_ATTACHMENT0,))
@@ -2955,30 +3008,34 @@ class WorldView(QOpenGLWidget):
         self._sv(prog, self._lo, "u_view", view)
         self._sv(prog, self._lo, "u_proj", proj)
         self._sv(prog, self._lo, "u_texel", QVector2D(1.0 / w, 1.0 / h))
-        self._sv(prog, self._lo, "u_radius",
-                 max(0.08, self._scene_radius * 0.012))
+        self._sv(prog, self._lo, "u_radius", radius)
         self._sv(prog, self._lo, "u_bias", 0.02)
-        self._sv(prog, self._lo, "u_intensity", 1.2)
+        self._sv(prog, self._lo, "u_intensity", 1.0)
         self._empty_vao.bind()
         gl.glDrawArrays(GL_TRIANGLES, 0, 3)
         self._empty_vao.release()
         prog.release()
 
-        if self._blur is not None and self._ao_blur_fbo is not None:
-            blur = self._blur
+        if self._ao_blur_fbo is not None:
+            blur = self._ao_blur
             bw, bh = self._ao_blur_fbo.width(), self._ao_blur_fbo.height()
+            sigma = max(0.15, radius * 2.5)
             self._empty_vao.bind()
             blur.bind()
-            self._sv(blur, self._blocs, "u_tex", 0)
-            for src, dst, direction in ((ao, self._ao_blur_fbo, (1.0, 0.0)),
-                                        (self._ao_blur_fbo, ao, (0.0, 1.0))):
-                dst.bind()
-                self._draw_buffers((GL_COLOR_ATTACHMENT0,))
-                gl.glViewport(0, 0, bw, bh)
-                self._bind_tex(0, src.texture())
-                self._sv(blur, self._blocs, "u_dir",
-                         QVector2D(direction[0] / bw, direction[1] / bh))
-                gl.glDrawArrays(GL_TRIANGLES, 0, 3)
+            self._bind_tex(2, texs[2])
+            self._sv(blur, self._aobloc, "u_tex", 0)
+            self._sv(blur, self._aobloc, "u_pos", 2)
+            self._sv(blur, self._aobloc, "u_depth_sigma", sigma)
+            for spread in (1.3, 2.7):
+                for src, dst, direction in ((ao, self._ao_blur_fbo, (1.0, 0.0)),
+                                            (self._ao_blur_fbo, ao, (0.0, 1.0))):
+                    dst.bind()
+                    self._draw_buffers((GL_COLOR_ATTACHMENT0,))
+                    gl.glViewport(0, 0, bw, bh)
+                    self._bind_tex(0, src.texture())
+                    self._sv(blur, self._aobloc, "u_dir", QVector2D(
+                        direction[0] * spread / bw, direction[1] * spread / bh))
+                    gl.glDrawArrays(GL_TRIANGLES, 0, 3)
             blur.release()
             self._empty_vao.release()
 

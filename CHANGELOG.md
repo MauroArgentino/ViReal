@@ -39,6 +39,10 @@ Todas las fechas son en formato AAAA-MM-DD.
   suavizada de la luz directa, y marchan el rayo reflejado contra el G-buffer:
   ni el disco solar, ni su aureola Mie, ni el cielo difuso atraviesan paredes o
   techos en el reflejo del piso. La iluminación directa mantiene sombras suaves.
+- La oclusión ya no salta de tono al girar la cámara: la prueba de profundidad
+  del SSAO es gradual, se normalizan las muestras válidas y el suavizado es
+  bilateral (respeta los bordes). La oclusión de reflejos también desaparece
+  con una transición suave en lugar de un corte seco.
 
 ### Referencia
 - Controles de sol de Enscape:

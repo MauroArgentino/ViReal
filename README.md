@@ -41,8 +41,8 @@ pie** con la cámara libre, mientras sigues modelando.
   conserve sombras suaves. Así un sol al este no se refleja en un piso protegido
   por planos a su alrededor.
 - **Motor HDR con *post-proceso***: la escena se dibuja en *float* (RGBA16F) y
-  se procesa en pasos separados — **SSAO** (oclusión ambiental, suavizado antes
-  de aplicarse), ***bloom*** (halo del sol y luces) y **composición** con
+  se procesa en pasos separados — **SSAO** (oclusión ambiental, suavizado
+  bilateral que respeta bordes), ***bloom*** (halo del sol y luces) y **composición** con
   *tone mapping* ACES y gamma.
 - **Reflejos en tiempo real (SSR)**: los pisos brillantes, el vidrio y el metal
   reflejan lo que tienen alrededor, mezclado con Fresnel por ángulo de visión y
