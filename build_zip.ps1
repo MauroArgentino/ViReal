@@ -4,14 +4,15 @@
 
 .DESCRIPTION
     Genera dist/ingetrazo_vireal-<version>.zip con vireal.py, README.md,
-    CHANGELOG.md, LICENSE, el HDR del horizonte y el visor Babylon.js.
+    CHANGELOG.md, LICENSE, el HDR, el visor Babylon.js y los loops CC0
+    de audio ambiente (pájaros de día, grillos de noche).
 
 .PARAMETER Version
     Versión a empaquetar. Si se omite, se toma del ``__version__`` de
     vireal.py (así no se desincronizan).
 
 .PARAMETER Install
-    Además de empaquetar, copia vireal.py y el HDR a la carpeta de plugins de IngeTrazo
+    Además de empaquetar, copia vireal.py, el HDR, Babylon y el audio a la carpeta de plugins de IngeTrazo
     del usuario actual (%APPDATA%\IngeTrazo\plugins) y borra el antiguo
     mundo.py si siguiera ahí.
 
@@ -57,6 +58,13 @@ $babylon = Join-Path $root "babylon"
 if (Test-Path $babylon) {
     Copy-Item $babylon (Join-Path $stage "babylon") -Recurse -Force
 }
+$audioFiles = @("birds_ambient.wav", "crickets_ambient.wav")
+$audioStage = Join-Path $stage "audio"
+New-Item -ItemType Directory -Path $audioStage -Force | Out-Null
+foreach ($name in $audioFiles) {
+    $p = Join-Path $root (Join-Path "audio" $name)
+    if (Test-Path $p) { Copy-Item $p (Join-Path $audioStage $name) }
+}
 
 $zip = Join-Path $dist "ingetrazo_vireal-$Version.zip"
 if (Test-Path $zip) { Remove-Item $zip -Force }
@@ -90,6 +98,16 @@ if ($Install) {
             Copy-Item $babylon $babylonDst -Recurse -Force
             Write-Host "Instalado visor Babylon en: $babylonDst" -ForegroundColor Green
         }
+        $audioDst = Join-Path $plugins "audio"
+        if (Test-Path $audioDst) { Remove-Item $audioDst -Recurse -Force }
+        New-Item -ItemType Directory -Path $audioDst -Force | Out-Null
+        foreach ($name in $audioFiles) {
+            $p = Join-Path $root (Join-Path "audio" $name)
+            if (Test-Path $p) {
+                Copy-Item $p (Join-Path $audioDst $name) -Force
+            }
+        }
+        Write-Host "Instalado audio en: $audioDst" -ForegroundColor Green
         Write-Host "Instalado en: $plugins\vireal.py" -ForegroundColor Green
         Write-Host "Reinicia IngeTrazo para cargarlo."
     }

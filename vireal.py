@@ -60,6 +60,7 @@ Instalar: copiar este archivo en la carpeta de plugins
 from __future__ import annotations
 
 import base64
+import ctypes
 import json
 import logging
 import math
@@ -95,6 +96,11 @@ from PySide6.QtOpenGL import (
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 try:  # noqa: BLE001
+    from PySide6.QtMultimedia import QAudioOutput, QSoundEffect
+except Exception:  # noqa: BLE001
+    QAudioOutput = None
+    QSoundEffect = None
+try:  # noqa: BLE001
     from PySide6.QtWebEngineCore import QWebEngineSettings
     from PySide6.QtWebEngineWidgets import QWebEngineView
 except Exception:  # noqa: BLE001
@@ -110,6 +116,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -117,7 +124,7 @@ from PySide6.QtWidgets import (
 log = logging.getLogger("ingetrazo.plugins.vireal")
 
 #: Versión de la extensión (coincide con el CHANGELOG y el paquete .zip).
-__version__ = "0.7.1"
+__version__ = "0.8.0"
 
 _SETTINGS = "vireal/"
 
@@ -165,6 +172,7 @@ GL_FRAMEBUFFER = 0x8D40
 GL_COLOR_ATTACHMENT0 = 0x8CE0
 GL_COLOR_ATTACHMENT1 = 0x8CE1
 GL_COLOR_ATTACHMENT2 = 0x8CE2
+GL_COLOR_ATTACHMENT3 = 0x8CE3
 
 #: Nombres de los uniformes de cada programa (PySide6 exige ``bytes`` en
 #: ``uniformLocation`` y la localización para valores float/int).
@@ -194,7 +202,7 @@ _SSAO_UNIFORMS = (
 _BRIGHT_UNIFORMS = ("u_tex", "u_threshold", "u_knee")
 _BLUR_UNIFORMS = ("u_tex", "u_dir", "u_texel")
 _COMPOSITE_UNIFORMS = (
-    "u_color", "u_ao", "u_bloom", "u_pos", "u_mat", "u_cam", "u_view",
+    "u_color", "u_ao", "u_bloom", "u_spec", "u_pos", "u_mat", "u_cam", "u_view",
     "u_proj", "u_exposure", "u_ao_strength", "u_bloom_amount", "u_env",
     "u_ssr_enable", "u_ssr_strength", "u_vignette",
 )
@@ -277,8 +285,10 @@ GRASS_WIDTH = 0.014
 
 WALK_EYE_RATIO = 0.93
 WALK_BODY_RADIUS = 0.25
-WALK_STEP_HEIGHT = 0.28
+WALK_STEP_HEIGHT = 0.30
 WALK_GRAVITY = 9.81
+CROUCH_HEIGHT = 1.05
+CROUCH_SPEED = 3.2
 
 #: Tope de hojas instanciadas por reconstrucción (una escena enorme no debe
 #: colgar la app). Con instancing el tope puede ser mucho más alto que antes.
@@ -355,29 +365,89 @@ float atmoPhaseM(float mu) {
 }
 
 // Dispersión del cielo en la dirección (unitaria) *dir*, SIN el disco solar.
-vec3 skyScatter(vec3 dir) {
+// sunGlowVisibility apaga el lóbulo Mie hacia el sol: en un reflejo en sombra
+// queda la niebla isotrópica, pero no la aureola que delata al sol oculto.
+vec3 skyScatter(vec3 dir, float sunGlowVisibility) {
     float am = atmoAirMass(dir.z);
     vec3 attn = exp(-(ATMO_OD_R + vec3(ATMO_OD_M * 1.1 * u_mie)) * am);
     float mu = dot(dir, u_sun_dir);
     // La raíz deja que el cenit conserve azul al atardecer (la luz que lo
     // ilumina viene de capas altas, menos extinguidas que el sol rasante).
     vec3 sunT = sqrt(max(atmoTrans(u_sun_dir.z), vec3(0.0)));
+    float miePhase = mix(3.0 / (16.0 * ATMO_PI), atmoPhaseM(mu),
+                         sunGlowVisibility);
     vec3 insc = (ATMO_OD_R * atmoPhaseR(mu)
-                 + vec3(ATMO_OD_M * u_mie) * atmoPhaseM(mu)) * (1.0 - attn);
+                 + vec3(ATMO_OD_M * u_mie) * miePhase) * (1.0 - attn);
     vec3 col = ATMO_SKY * u_sky_tint * sunT * insc + u_sky_floor * u_sky_tint;
     // Bajo el horizonte: rebote del suelo.
     float below = 1.0 - smoothstep(-0.12, 0.0, dir.z);
     return mix(col, u_gnd_col, below);
 }
 
-// Cielo completo (dispersión + disco solar con borde suave).
-vec3 skyRadiance(vec3 dir) {
-    vec3 col = skyScatter(dir);
+vec3 skyScatter(vec3 dir) {
+    return skyScatter(dir, 1.0);
+}
+
+// Cuánto predomina la noche (0 de día, 1 con el sol bien bajo).
+float nightAmount() {
+    return 1.0 - smoothstep(-0.12, 0.03, u_sun_dir.z);
+}
+
+// La luna se sitúa enfrente del sol, con una leve inclinación para que no
+// quede exactamente en el antípoda y se pueda ver durante el crepúsculo.
+vec3 moonDir() {
+    vec3 m = vec3(-u_sun_dir.x, -u_sun_dir.y, -u_sun_dir.z + 0.10);
+    float len = length(m);
+    return (len > 1e-4) ? m / len : vec3(0.0, 0.0, 1.0);
+}
+
+float atmoHash(vec3 p) {
+    return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453);
+}
+
+// Estrellas discretas en una rejilla direccional: aparecen sólo de noche.
+float starField(vec3 d) {
+    vec3 p = d * 240.0;
+    vec3 id = floor(p);
+    vec3 f = fract(p) - 0.5;
+    float h = atmoHash(id);
+    float present = step(0.9972, h);
+    vec2 off = vec2(atmoHash(id + 1.0), atmoHash(id + 2.0)) - 0.5;
+    float r = length(f.xy - off * 0.55);
+    float core = 1.0 - smoothstep(0.0, 0.075, r);
+    return present * core * (0.45 + 0.55 * atmoHash(id + 3.0))
+         * step(-0.02, d.z);
+}
+
+// Luz lunar difusa: fría y mucho más débil que el sol.
+vec3 moonLight() {
+    return vec3(0.16, 0.21, 0.36) * nightAmount() * 0.55;
+}
+
+// Cielo completo (dispersión + sol, luna y estrellas con borde suave).
+// discVisibility permite apagar los discos en reflejos de superficies en sombra:
+// el cielo difuso sigue iluminando, pero el sol no se refleja bajo un techo.
+vec3 skyRadiance(vec3 dir, float discVisibility) {
+    vec3 col = skyScatter(dir, discVisibility);
     float mu = dot(dir, u_sun_dir);
     float ang = acos(clamp(mu, -1.0, 1.0));
     float disc = 1.0 - smoothstep(ATMO_ANG * 0.7, ATMO_ANG * 1.3, ang);
-    col += ATMO_DISC * u_sun_tint * atmoTrans(u_sun_dir.z) * disc;
+    col += ATMO_DISC * u_sun_tint * atmoTrans(u_sun_dir.z) * disc
+         * discVisibility;
+
+    float night = nightAmount() * discVisibility;
+    vec3 md = moonDir();
+    float mang = acos(clamp(dot(dir, md), -1.0, 1.0));
+    float mdisc = 1.0 - smoothstep(0.011, 0.018, mang);
+    float halo = exp(-mang * mang * 220.0);
+    col += night * (vec3(1.0, 0.97, 0.88) * mdisc * 1.7
+                    + vec3(0.18, 0.24, 0.40) * halo * 0.35);
+    col += night * vec3(0.80, 0.86, 1.0) * starField(dir) * 1.3;
     return col;
+}
+
+vec3 skyRadiance(vec3 dir) {
+    return skyRadiance(dir, 1.0);
 }
 
 // Luz solar directa (color HDR × intensidad), con extinción y apagado de noche.
@@ -447,6 +517,7 @@ uniform float u_opacity;
 layout(location = 0) out vec4 out_color;  // radiancia HDR (sin tonemap)
 layout(location = 1) out vec4 out_mat;    // normal.xyz + rugosidad
 layout(location = 2) out vec4 out_pos;    // posición mundo + reflectividad
+layout(location = 3) out vec4 out_spec;   // especular de entorno aislado
 
 const vec2 POISSON[12] = vec2[12](
     vec2(-0.326, -0.406), vec2(-0.840, -0.074), vec2(-0.696, 0.457),
@@ -462,7 +533,7 @@ float unpackDepth(vec3 e) {
 // Sombras suaves (PCSS): se busca la profundidad media de los bloqueadores y
 // el radio del filtro crece con la penumbra, así las sombras lejanas quedan
 // más difusas que las que tocan el objeto.
-float shadowFactor(vec3 wpos, float ndl) {
+float shadowFactor(vec3 wpos, float ndl, float strength) {
     if (u_shadow_enable == 0) return 1.0;
     vec4 lp = u_light_vp * vec4(wpos, 1.0);
     vec3 uvz = lp.xyz / lp.w * 0.5 + 0.5;
@@ -507,7 +578,11 @@ float shadowFactor(vec3 wpos, float ndl) {
         float d = unpackDepth(texture(u_shadow, uvz.xy + off).rgb);
         lit += (uvz.z + dot(grad, off) - bias <= d) ? 1.0 : 0.0;
     }
-    return mix(1.0, lit / 12.0, u_shadow_strength);
+    return mix(1.0, lit / 12.0, strength);
+}
+
+float shadowFactor(vec3 wpos, float ndl) {
+    return shadowFactor(wpos, ndl, u_shadow_strength);
 }
 
 vec2 dirToEquirectUV(vec3 d) {
@@ -561,6 +636,9 @@ void main() {
     float ndh = max(dot(N, H), 0.0);
 
     float sh = shadowFactor(v_world, ndl);
+    // Sombra dura separada: el refinamiento suave de u_shadow_strength es
+    // agradable para la luz directa, pero deja escapar demasiado reflejo.
+    float hardSh = shadowFactor(v_world, ndl, 1.0);
 
     // Cook-Torrance GGX. El sol tiene un tamaño angular finito y la bruma lo
     // agranda: se ensancha el lóbulo especular para que el brillo sea suave
@@ -591,23 +669,42 @@ void main() {
         vec3 hdriN = texture(u_hdr, dirToEquirectUV(N)).rgb * 0.65;
         envDiff = mix(envDiff, hdriN, 0.65);
     }
-    vec3 amb = albedo * (envDiff + u_gnd_col * 0.25) * u_ambient * 0.85;
+    // Ambiente más natural: se desatura un poco el azul del cielo (muy
+    // satinado en un modelo de Rayleigh puro) y se refuerza con moderación
+    // el relleno hemisférico de las caras verticales y su rebote lateral.
+    float dayFill = smoothstep(-0.04, 0.10, u_sun_dir.z);
+    float vertical = 1.0 - abs(N.z);
+    float lum = dot(envDiff, vec3(0.2126, 0.7152, 0.0722));
+    envDiff = mix(vec3(lum), envDiff, 0.70);
+    float shadeSide = clamp(0.5 - 0.5 * dot(N, L), 0.0, 1.0);
+    envDiff += skyScatter(normalize(L + vec3(0.0, 0.0, 0.35)))
+             * shadeSide * 0.08 * dayFill;
+    float fill = 1.0 + 0.65 * vertical * dayFill;
+    vec3 gndFill = u_gnd_col * (0.25 + 0.30 * vertical * dayFill);
+    vec3 amb = albedo * (envDiff * fill + gndFill) * u_ambient * 0.85;
 
     // Reflejo del entorno: el mismo cielo que se ve de fondo, difuminado con
     // la rugosidad (se mezcla con el ambiente difuso).
     vec3 R = reflect(-V, N);
-    vec3 env = skyRadiance(R);
+    // De noche el mapa de sombras del sol no es representativo: conserva luna
+    // y estrellas. De día, usa la sombra dura: cualquier pared/techo que tape
+    // al sol también debe tapar el cielo que se refleja en esta superficie.
+    float reflVis = mix(1.0, hardSh, smoothstep(-0.02, 0.08, u_sun_dir.z));
+    vec3 env = skyRadiance(R, reflVis);
     if (u_hdr_enable == 1) {
         vec3 hdri = texture(u_hdr, dirToEquirectUV(R)).rgb;
         float horizon = 1.0 - smoothstep(-0.10, 0.18, R.z);
-        env = mix(env, hdri * 0.55, horizon);
+        env = mix(env, hdri * 0.55, horizon * reflVis);
     }
     env = mix(skyAmbient(N), env, clamp(1.0 - rough * 1.6, 0.0, 1.0));
+    env *= reflVis;
     float fres = pow(1.0 - ndv, 5.0);
     vec3 Fenv = F0 + (1.0 - F0) * fres;
     vec3 ambientSpec = env * Fenv * pow(1.0 - rough, 2.0) * u_env;
 
-    vec3 col = direct + amb + ambientSpec;
+    vec3 moonIllum = moonLight() * max(dot(N, moonDir()), 0.0);
+    vec3 col = direct + albedo * moonIllum / 3.141593 * 0.8
+             + amb + ambientSpec;
 
     if (trans > 0.0) {
         float fres2 = pow(1.0 - ndv, 3.0);
@@ -618,6 +715,7 @@ void main() {
     out_color = vec4(col, u_opacity * base.a);
     out_mat = vec4(N, rough);
     out_pos = vec4(v_world, 1.0 - rough);
+    out_spec = vec4(ambientSpec, 1.0);
 }
 """
 
@@ -643,6 +741,7 @@ uniform int u_hdr_enable;
 layout(location = 0) out vec4 out_color;
 layout(location = 1) out vec4 out_mat;
 layout(location = 2) out vec4 out_pos;
+layout(location = 3) out vec4 out_spec;
 
 vec2 dirToEquirectUV(vec3 d) {
     float u = atan(d.y, d.x) / (2.0 * ATMO_PI) + 0.5;
@@ -662,6 +761,7 @@ void main() {
     out_color = vec4(col, 1.0);
     out_mat = vec4(0.0);   // el cielo no tiene normal: se salta SSR/SSAO
     out_pos = vec4(0.0);
+    out_spec = vec4(0.0);
 }
 """
 
@@ -771,6 +871,7 @@ uniform float u_shadow_strength;
 layout(location = 0) out vec4 out_color;
 layout(location = 1) out vec4 out_mat;
 layout(location = 2) out vec4 out_pos;
+layout(location = 3) out vec4 out_spec;
 
 float unpackDepth(vec3 e) {
     return dot(e, vec3(1.0, 1.0 / 255.0, 1.0 / 65025.0));
@@ -816,15 +917,23 @@ void main() {
     float sh = grassShadow(v_world);
 
     vec3 direct = albedo * sunLight() * ndl * sh / 3.141593 * 1.25;
-    vec3 amb = albedo * (skyAmbient(N) + u_gnd_col * 0.35)
+    float dayFill = smoothstep(-0.04, 0.10, u_sun_dir.z);
+    float vertical = 1.0 - abs(N.z);
+    vec3 gEnv = skyAmbient(N);
+    float lum = dot(gEnv, vec3(0.2126, 0.7152, 0.0722));
+    gEnv = mix(vec3(lum), gEnv, 0.75);
+    vec3 amb = albedo * (gEnv * (1.0 + 0.25 * vertical * dayFill)
+             + u_gnd_col * (0.35 + 0.10 * vertical * dayFill))
              * u_ambient * 0.85;
-    vec3 col = direct + amb;
+    vec3 moonIllum = moonLight() * max(dot(N, moonDir()), 0.0);
+    vec3 col = direct + albedo * moonIllum / 3.141593 + amb;
     // Translucencia aproximada: las puntas dejan pasar algo de sol.
     col += albedo * sunLight() * 0.07 * v_t * sh;
 
     out_color = vec4(col, 1.0);
     out_mat = vec4(N, 0.95);   // el césped es difuso: sin SSR
     out_pos = vec4(v_world, 0.05);
+    out_spec = vec4(0.0);
 }
 """
 
@@ -949,6 +1058,7 @@ in vec2 v_uv;
 uniform sampler2D u_color;
 uniform sampler2D u_ao;
 uniform sampler2D u_bloom;
+uniform sampler2D u_spec;
 uniform sampler2D u_pos;
 uniform sampler2D u_mat;
 uniform vec3 u_cam;
@@ -968,30 +1078,57 @@ vec3 aces(vec3 x) {
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
 }
 
+// ¿Hay geometría opaca en el camino del rayo reflejado? Si la hay, el cielo
+// (y por tanto el sol) no puede verse en ese reflejo, aunque el p receptor
+// esté iluminado. La información sale del G-buffer de la pasada de escena.
+float reflectionOcclusion(vec3 P, vec3 R) {
+    vec3 ray = P + R * 0.10;
+    float stride = max(0.05, length(P - u_cam) * 0.008);
+    for (int i = 0; i < 24; i++) {
+        ray += R * stride;
+        vec4 clip = u_proj * u_view * vec4(ray, 1.0);
+        if (clip.w <= 0.0) break;
+        vec2 uv = clip.xy / clip.w * 0.5 + 0.5;
+        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) break;
+        vec3 sp = texture(u_pos, uv).xyz;
+        if (length(sp) > 1e-4) {
+            float tol = 0.06 * (1.0 + float(i) * 0.05);
+            if (length(sp - ray) < tol) return 0.0;
+        }
+        stride *= 1.10;
+    }
+    return 1.0;
+}
+
 void main() {
     vec3 col = texture(u_color, v_uv).rgb;
+    vec3 spec = texture(u_spec, v_uv).rgb;
 
     // Sombra ambiental.
-    float ao = texture(u_ao, v_uv).r;
-    col *= mix(1.0, ao, u_ao_strength);
+    float aoMul = mix(1.0, texture(u_ao, v_uv).r, u_ao_strength);
+    col *= aoMul;
+    spec *= aoMul;
 
-    // Reflejos en pantalla (SSR) sobre lo glossy.
-    if (u_ssr_enable == 1) {
-        vec3 N = texture(u_mat, v_uv).xyz;
-        float rough = texture(u_mat, v_uv).a;
-        vec3 P = texture(u_pos, v_uv).xyz;
-        if (length(N) > 0.2 && rough < 0.45 && length(P) > 1e-4) {
-            N = normalize(N);
-            vec3 V = normalize(u_cam - P);
-            float ndv = max(dot(N, V), 1e-3);
-            vec3 R = reflect(-V, N);
+    float envVis = 1.0;
+    vec3 N = texture(u_mat, v_uv).xyz;
+    float rough = texture(u_mat, v_uv).a;
+    vec3 P = texture(u_pos, v_uv).xyz;
+    if (length(N) > 0.2 && rough < 0.45 && length(P) > 1e-4) {
+        N = normalize(N);
+        vec3 V = normalize(u_cam - P);
+        float ndv = max(dot(N, V), 1e-3);
+        vec3 R = reflect(-V, N);
+        envVis = reflectionOcclusion(P, R);
+
+        // Reflejos en pantalla (SSR) sobre lo glossy.
+        if (u_ssr_enable == 1) {
             vec3 ray = P + N * 0.03;
-            float step = max(0.05, length(P - u_cam) * 0.01);
+            float stride = max(0.05, length(P - u_cam) * 0.01);
             float conf = 0.0;
             vec3 hitc = vec3(0.0);
             vec2 lastUv = v_uv;
             for (int i = 0; i < 28; i++) {
-                ray += R * step;
+                ray += R * stride;
                 vec4 clip = u_proj * u_view * vec4(ray, 1.0);
                 if (clip.w <= 0.0) break;
                 vec2 suv = clip.xy / clip.w * 0.5 + 0.5;
@@ -1008,7 +1145,7 @@ void main() {
                         break;
                     }
                 }
-                step *= 1.08;
+                stride *= 1.08;
             }
             // Fundido cerca de los bordes (la info de pantalla se acaba ahí).
             float edge = smoothstep(0.0, 0.08, lastUv.x)
@@ -1025,6 +1162,11 @@ void main() {
             col = mix(col, hitc, w * conf);
         }
     }
+
+    // El especular de entorno se vuelve a ponderar con la oclusión del rayo:
+    // un muro o techo en el camino lo elimina, sin tocar la luz difusa.
+    col = max(col - spec, 0.0);
+    col += spec * envVis;
 
     // Bloom.
     col += texture(u_bloom, v_uv).rgb * u_bloom_amount;
@@ -1217,7 +1359,11 @@ class WalkCollider:
                 continue
             if self._dist2_xy(x, y, t) >= r2:
                 continue
-            if walk and zhi <= feet + step_h and zlo <= feet + step_h:
+            if zhi <= feet + step_h and zlo <= feet + step_h:
+                if step is None or zhi > step:
+                    step = zhi
+                continue
+            if walk and zhi <= feet + step_h:
                 if step is None or zhi > step:
                     step = zhi
             else:
@@ -1882,6 +2028,10 @@ class WorldView(QOpenGLWidget):
         self.mouse_invert = 0
         self.walk = False
         self.eye_height = 1.75
+        self._crouch = False
+        self._eye_current = 1.75
+        self._hour_override = None
+        self._base_light_key = None
         self._collider = None
         self._walk_vz = 0.0
         self._shadow_dirty = True
@@ -1889,6 +2039,8 @@ class WorldView(QOpenGLWidget):
 
         self._keys: set = set()
         self._looking = False
+        self._scrubbing_time = False
+        self._scrub_x = 0
         self._last_mouse = QPoint()
         self._clock = QElapsedTimer()
         self._clock.start()
@@ -1926,6 +2078,34 @@ class WorldView(QOpenGLWidget):
         self._walk_vz = 0.0
         self.update()
 
+    def _sun_hour(self) -> float:
+        if math.hypot(self._sun_dir.x(), self._sun_dir.y()) < 1e-6:
+            return 12.0 if self._sun_dir.z() >= 0.0 else 0.0
+        az = math.atan2(self._sun_dir.y(), self._sun_dir.x())
+        return (6.0 + az / (2.0 * math.pi) * 24.0) % 24.0
+
+    def scrub_hour(self, delta_hours: float) -> None:
+        if self._hour_override is None:
+            self._hour_override = self._sun_hour()
+            self._base_light_key = self._light_key
+        self._hour_override = (self._hour_override + float(delta_hours)) % 24.0
+        self._refresh_light()
+        self.mark_dirty()
+        self.update()
+
+    def reset_hour_override(self) -> None:
+        if self._hour_override is None:
+            return
+        self._hour_override = None
+        self._light_key = self._base_light_key
+        self._base_light_key = None
+        self._refresh_light()
+        self.mark_dirty()
+        self.update()
+
+    def current_hour(self) -> float | None:
+        return self._hour_override
+
     def _apply_movement(self) -> None:
         now = self._clock.elapsed() / 1000.0
         dt = min(0.1, max(0.0, now - self._last_t))
@@ -1960,8 +2140,27 @@ class WorldView(QOpenGLWidget):
                 return
         if self._collider is None:
             return
-        eye = self.eye_height * WALK_EYE_RATIO
+        col = self._collider
+
+        target_eye = CROUCH_HEIGHT if self._crouch else self.eye_height
+        cur_eye = self._eye_current
+        if target_eye > cur_eye + 1e-4:
+            feet_now = cam.pos.z() - cur_eye * WALK_EYE_RATIO
+            blocked, _ = col.blocked(cam.pos.x(), cam.pos.y(), feet_now,
+                                     target_eye * WALK_EYE_RATIO,
+                                     WALK_BODY_RADIUS, 0.0)
+            if blocked:
+                target_eye = cur_eye
+        diff = target_eye - cur_eye
+        max_move = CROUCH_SPEED * dt
+        if abs(diff) <= max_move:
+            cur_eye = target_eye
+        else:
+            cur_eye += math.copysign(max_move, diff)
+        self._eye_current = cur_eye
+        eye = cur_eye * WALK_EYE_RATIO
         feet = cam.pos.z() - eye
+
         f = QVector3D(f.x(), f.y(), 0.0)
         r = QVector3D(r.x(), r.y(), 0.0)
         if f.lengthSquared() > 1e-9:
@@ -1981,9 +2180,8 @@ class WorldView(QOpenGLWidget):
         if Qt.Key_A in self._keys:
             dx -= r.x() * step
             dy -= r.y() * step
-        col = self._collider
         nx, ny, stair = col.move(cam.pos.x(), cam.pos.y(), feet, dx, dy,
-                                 self.eye_height, WALK_BODY_RADIUS,
+                                 cur_eye, WALK_BODY_RADIUS,
                                  WALK_STEP_HEIGHT)
         if stair is not None and stair > feet:
             feet = stair
@@ -2251,6 +2449,8 @@ class WorldView(QOpenGLWidget):
         lat = getattr(datum, "lat", None)
         lon = getattr(datum, "lon", None)
         north = getattr(datum, "north", 0.0)
+        if self._hour_override is not None:
+            return ("override", round(self._hour_override, 3), north)
         when = None
         if callable(getattr(sh, "when_utc", None)):
             try:
@@ -2266,26 +2466,43 @@ class WorldView(QOpenGLWidget):
     def _update_light(self) -> None:
         scene = getattr(self.app.viewport, "scene", None)
         d = QVector3D(0.35, 0.45, 0.82)
-        try:
-            from core.sun import DEFAULT_LAT, DEFAULT_LON, sun_direction
-            sh = getattr(scene, "shadows", None)
+        if self._hour_override is None:
+            try:
+                from core.sun import DEFAULT_LAT, DEFAULT_LON, sun_direction
+                sh = getattr(scene, "shadows", None)
+                datum = getattr(scene, "georef", None)
+                lat = getattr(datum, "lat", None)
+                lon = getattr(datum, "lon", None)
+                if lat is None or lon is None:
+                    lat, lon = DEFAULT_LAT, DEFAULT_LON
+                if sh is not None:
+                    vec = sun_direction(lat, lon, sh.when_utc(lon))
+                    if vec is not None:
+                        d = QVector3D(vec[0], vec[1], vec[2])
+                        north = getattr(datum, "north", 0.0)
+                        if datum is not None and north:
+                            # El sol llega en ejes de cuadrícula; el modelo
+                            # puede estar girado por el norte del datum.
+                            gx, gy = datum.grid_to_local_xy(d.x(), d.y())
+                            d = QVector3D(gx, gy, d.z())
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            hour = self._hour_override
+            ang = (hour - 6.0) / 24.0 * 2.0 * math.pi
+            elev = math.sin((hour - 6.0) / 12.0 * math.pi)
+            hor = math.sqrt(max(0.0, 1.0 - elev * elev))
+            d = QVector3D(math.cos(ang) * hor, math.sin(ang) * hor, elev)
             datum = getattr(scene, "georef", None)
-            lat = getattr(datum, "lat", None)
-            lon = getattr(datum, "lon", None)
-            if lat is None or lon is None:
-                lat, lon = DEFAULT_LAT, DEFAULT_LON
-            if sh is not None:
-                vec = sun_direction(lat, lon, sh.when_utc(lon))
-                if vec is not None:
-                    d = QVector3D(vec[0], vec[1], vec[2])
-                    north = getattr(datum, "north", 0.0)
-                    if datum is not None and north:
-                        # El sol llega en ejes de cuadrícula; el modelo puede
-                        # estar girado por el ángulo norte del datum.
-                        gx, gy = datum.grid_to_local_xy(d.x(), d.y())
-                        d = QVector3D(gx, gy, d.z())
-        except Exception:  # noqa: BLE001
-            pass
+            north = getattr(datum, "north", 0.0)
+            if datum is not None and hasattr(datum, "grid_to_local_xy"):
+                gx, gy = datum.grid_to_local_xy(d.x(), d.y())
+                d = QVector3D(gx, gy, d.z())
+            elif north:
+                a = math.radians(north)
+                c, s = math.cos(a), math.sin(a)
+                d = QVector3D(d.x() * c - d.y() * s,
+                              d.x() * s + d.y() * c, d.z())
         if d.lengthSquared() < 1e-9:
             d = QVector3D(0.35, 0.45, 0.82)
         self._sun_dir = d.normalized()
@@ -2488,6 +2705,7 @@ class WorldView(QOpenGLWidget):
             if self._mrt:
                 fbo.addColorAttachment(w, h)
                 fbo.addColorAttachment(w, h)
+                fbo.addColorAttachment(w, h)
             self._scene_fbo = fbo
             self._fb_size = (w, h)
         except Exception as ex:  # noqa: BLE001
@@ -2582,7 +2800,7 @@ class WorldView(QOpenGLWidget):
         fbo.bind()
         if self._mrt and len(texs) >= 3:
             self._draw_buffers((GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1,
-                                GL_COLOR_ATTACHMENT2))
+                                GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT3))
         gl.glViewport(0, 0, w, h)
         gl.glClearColor(0.0, 0.0, 0.0, 0.0)
         gl.glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
@@ -2819,15 +3037,22 @@ class WorldView(QOpenGLWidget):
         self._bind_tex(0, texs[0])
         self._bind_tex(1, ao_tex if ao_tex else self._white().textureId())
         self._bind_tex(2, bloom_tex if bloom_tex else self._black().textureId())
-        if self._mrt and len(texs) >= 3:
+        if self._mrt and len(texs) >= 4:
             self._bind_tex(3, texs[2])
             self._bind_tex(4, texs[1])
+            self._bind_tex(5, texs[3])
+        elif self._mrt and len(texs) >= 3:
+            self._bind_tex(3, texs[2])
+            self._bind_tex(4, texs[1])
+            self._bind_tex(5, self._black().textureId())
         else:
             self._bind_tex(3, self._black().textureId())
             self._bind_tex(4, self._black().textureId())
+            self._bind_tex(5, self._black().textureId())
         self._sv(prog, self._lc, "u_color", 0)
         self._sv(prog, self._lc, "u_ao", 1)
         self._sv(prog, self._lc, "u_bloom", 2)
+        self._sv(prog, self._lc, "u_spec", 5)
         self._sv(prog, self._lc, "u_pos", 3)
         self._sv(prog, self._lc, "u_mat", 4)
         self._sv(prog, self._lc, "u_cam", self.camera.pos)
@@ -2853,7 +3078,17 @@ class WorldView(QOpenGLWidget):
         """Parámetros de la paleta atmosférica elegida (sin la elevación del
         sol: la física del sol la resuelven los shaders a partir de u_sun_dir)."""
         idx = max(0, min(len(_SKY_PRESETS) - 1, int(self.sky_preset)))
+        if self._hour_override is not None:
+            z = self._sun_dir.z()
+            if z < -0.03:
+                idx = 3
+            elif z < 0.14:
+                idx = 1
+            elif idx == 3:
+                idx = 0
         _name, sun_t, sky_t, mie, floor, gnd = _SKY_PRESETS[idx]
+        if self._hour_override is not None:
+            mie *= 1.0 + 0.18 * math.sin(self._hour_override * 0.9)
         return (QVector3D(*sun_t), QVector3D(*sky_t), QVector3D(*gnd),
                 float(mie), QVector3D(*floor))
 
@@ -2929,7 +3164,13 @@ class WorldView(QOpenGLWidget):
                   -(lo.y() + hi.y()) * 0.5]
         radius = max(hi.x() - lo.x(), hi.y() - lo.y(),
                      hi.z() - lo.z(), 2.0) * 0.9
-        sun_t, _sky_t, _gnd, _mie, floor = self._atmo()
+        sun_t, sky_t, gnd, _mie, floor = self._atmo()
+        sky_col = [min(1.0, max(0.0, sky_t.x() * 0.32 + floor.x())),
+                   min(1.0, max(0.0, sky_t.y() * 0.42 + floor.y())),
+                   min(1.0, max(0.0, sky_t.z() * 0.62 + floor.z()))]
+        gnd_col = [min(1.0, max(0.0, gnd.x())),
+                   min(1.0, max(0.0, gnd.y())),
+                   min(1.0, max(0.0, gnd.z()))]
         stats = self._stats or ""
         if geo is not None and used < self._vcount:
             stats += " · Babylon: %d/%d vértices" % (used, self._vcount)
@@ -2941,9 +3182,8 @@ class WorldView(QOpenGLWidget):
             "sunColor": [min(1.0, max(0.0, sun_t.x())),
                          min(1.0, max(0.0, sun_t.y())),
                          min(1.0, max(0.0, sun_t.z()))],
-            "skyColor": [min(1.0, max(0.0, floor.x())),
-                         min(1.0, max(0.0, floor.y())),
-                         min(1.0, max(0.0, floor.z()))],
+            "skyColor": sky_col,
+            "groundColor": gnd_col,
             "ambient": float(self.ambient),
             "stats": stats,
         }
@@ -2959,9 +3199,14 @@ class WorldView(QOpenGLWidget):
                 "ViReal — ratón: mirar (arrastra) · W/A/S/D: mover · "
                 "Q/E: bajar/subir · rueda: acercar",
                 "Shift: correr · R: reencuadrar · Espacio: gravedad " +
-                ("ACTIVA (colisiones)" if self.walk else "inactiva (vuelo)"),
-                "T: sombras · C: césped · V: viento · F: reflejos · "
-                "G: oclusión · B: bloom · N: cielo",
+                ("ACTIVA (colisiones)" if self.walk else "inactiva (vuelo)") +
+                (" · C: agachado" if self._crouch else ""),
+                "C: agacharse · H: césped · T: sombras · V: viento · "
+                "F: reflejos · G: oclusión · B: bloom · N: cielo",
+                "Rueda/Shift+der: hora · U/I: hora · Home: restaurar" +
+                ((" · %02d:%02d" % (int(self._hour_override),
+                                    int((self._hour_override % 1) * 60)))
+                 if self._hour_override is not None else ""),
             ]
             if self._stats:
                 lines.append(self._stats)
@@ -3001,6 +3246,14 @@ class WorldView(QOpenGLWidget):
                 chk.setChecked(self.walk)
                 chk.blockSignals(False)
             return
+        if k in (Qt.Key_U, Qt.Key_I):
+            if not ev.isAutoRepeat():
+                self.scrub_hour(0.10 if k == Qt.Key_U else -0.10)
+            return
+        if k == Qt.Key_Home:
+            if not ev.isAutoRepeat():
+                self.reset_hour_override()
+            return
         if k == Qt.Key_R:
             self.frame_scene()
             return
@@ -3009,7 +3262,9 @@ class WorldView(QOpenGLWidget):
             self.update()
             return
         if k == Qt.Key_C:
-            self.grass = not self.grass
+            if ev.isAutoRepeat():
+                return
+            self._crouch = True
             self.update()
             return
         if k == Qt.Key_V:
@@ -3022,6 +3277,10 @@ class WorldView(QOpenGLWidget):
             return
         if k == Qt.Key_G:
             self.ssao = not self.ssao
+            self.update()
+            return
+        if k == Qt.Key_H:
+            self.grass = not self.grass
             self.update()
             return
         if k == Qt.Key_B:
@@ -3037,12 +3296,21 @@ class WorldView(QOpenGLWidget):
         super().keyPressEvent(ev)
 
     def keyReleaseEvent(self, ev) -> None:
+        if ev.key() == Qt.Key_C:
+            self._crouch = False
+            self.update()
         self._keys.discard(ev.key())
         self._mods = ev.modifiers()
         super().keyReleaseEvent(ev)
 
     def mousePressEvent(self, ev) -> None:
-        if ev.button() in (Qt.LeftButton, Qt.RightButton, Qt.MiddleButton):
+        shift = bool(ev.modifiers() & Qt.ShiftModifier)
+        if ev.button() == Qt.MiddleButton or (
+                ev.button() == Qt.RightButton and shift):
+            self._scrubbing_time = True
+            self._scrub_x = ev.position().x()
+            self.setCursor(Qt.SizeHorCursor)
+        elif ev.button() in (Qt.LeftButton, Qt.RightButton):
             self._looking = True
             self._last_mouse = ev.position().toPoint()
             self.setCursor(Qt.BlankCursor)
@@ -3050,11 +3318,14 @@ class WorldView(QOpenGLWidget):
 
     def mouseReleaseEvent(self, ev) -> None:
         self._looking = False
+        self._scrubbing_time = False
         self.unsetCursor()
 
     def _release_input(self) -> None:
         self._keys.clear()
         self._looking = False
+        self._scrubbing_time = False
+        self._crouch = False
         self._mods = Qt.NoModifier
         self.unsetCursor()
 
@@ -3067,6 +3338,13 @@ class WorldView(QOpenGLWidget):
         super().hideEvent(ev)
 
     def mouseMoveEvent(self, ev) -> None:
+        if self._scrubbing_time:
+            x = ev.position().x()
+            dx = x - self._scrub_x
+            self._scrub_x = x
+            if dx:
+                self.scrub_hour(dx * 0.022)
+            return
         if self._looking and ev.buttons() == Qt.NoButton:
             self._looking = False
             self.unsetCursor()
@@ -3095,7 +3373,9 @@ class BabylonWindow(QDialog):
     def __init__(self, view, owner=None) -> None:
         super().__init__(view)
         self.setWindowTitle("ViReal — Babylon.js (beta)")
-        self.setWindowFlag(Qt.Window, True)
+        self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint
+                            | Qt.WindowMaximizeButtonHint
+                            | Qt.WindowCloseButtonHint)
         self.setModal(False)
         self.resize(1120, 720)
         self._view = view
@@ -3163,13 +3443,26 @@ class WorldWindow(QDialog):
     def __init__(self, app) -> None:
         super().__init__(app.window)
         self.setWindowTitle("ViReal — render en vivo " + __version__)
-        self.setWindowFlag(Qt.Window, True)
+        self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint
+                            | Qt.WindowMaximizeButtonHint
+                            | Qt.WindowCloseButtonHint)
         self.setModal(False)
         self.resize(1120, 720)
         self.setSizeGripEnabled(True)
 
         self.view = WorldView(app, self)
         self._babylon_window = None
+        self.settings = QSettings()
+        self._audio = None
+        self._audio_output = None
+        self._audio_backend = None
+        self._audio_paths = {}
+        self._audio_mode = None
+        self._audio_timer = None
+        self._winmm = None
+        self._winmm_playing = False
+        self._audio_enabled = False
+        self._init_audio()
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -3177,7 +3470,6 @@ class WorldWindow(QDialog):
         root.addWidget(self._build_bar(app), 0)
         root.addWidget(self.view, 1)
 
-        self.settings = QSettings()
         self._load_view_state()
 
     def _build_bar(self, app) -> QWidget:
@@ -3228,6 +3520,26 @@ class WorldWindow(QDialog):
         self.chk_wind.setToolTip("Anima el césped (tecla V)")
         self.chk_wind.toggled.connect(self._on_wind)
         lay.addWidget(self.chk_wind)
+
+        self.chk_birds = QCheckBox("Ambiente", row1)
+        self.chk_birds.setEnabled(self._audio_backend is not None)
+        backend_name = {"qt": "QtMultimedia", "winmm": "audio de Windows"}.get(
+            self._audio_backend, "no disponible")
+        self.chk_birds.setToolTip(
+            "Pájaros de día y grillos de noche. Backend: " + backend_name)
+        self.chk_birds.toggled.connect(self._on_birds)
+        lay.addWidget(self.chk_birds)
+
+        self.sld_birds = QSlider(Qt.Horizontal, row1)
+        self.sld_birds.setRange(0, 100)
+        self.sld_birds.setValue(35)
+        self.sld_birds.setFixedWidth(70)
+        self.sld_birds.setEnabled(self._audio_backend == "qt")
+        self.sld_birds.setToolTip(
+            "Volumen del audio ambiente" if self._audio_backend == "qt"
+            else "Volumen no disponible con el audio de Windows")
+        self.sld_birds.valueChanged.connect(self._on_birds_volume)
+        lay.addWidget(self.sld_birds)
 
         lay.addWidget(QLabel("Exposición", row1))
         self.spin_exp = QDoubleSpinBox(row1)
@@ -3360,6 +3672,131 @@ class WorldWindow(QDialog):
         self.view.shadows = bool(on)
         self.view.update()
 
+    def _init_audio(self) -> None:
+        base = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "audio")
+        candidates = {
+            "day": ("birds_ambient.wav", "birds_cc0.wav"),
+            "night": ("crickets_ambient.wav", "crickets_cc0_source.wav"),
+        }
+        for mode, names in candidates.items():
+            for name in names:
+                path = os.path.join(base, name)
+                if os.path.isfile(path):
+                    self._audio_paths[mode] = path
+                    break
+        if not self._audio_paths:
+            log.warning("ViReal: no encontré loops de audio ambiente")
+            return
+        first = self._audio_paths.get("day") or self._audio_paths.get("night")
+        if QSoundEffect is not None and QAudioOutput is not None:
+            try:
+                out = QAudioOutput(self)
+                out.setVolume(0.35)
+                snd = QSoundEffect(self)
+                snd.setAudioOutput(out)
+                snd.setSource(QUrl.fromLocalFile(first))
+                loop = getattr(QSoundEffect, "Infinite", None)
+                if loop is None:
+                    loop = getattr(getattr(QSoundEffect, "Loop", object),
+                                   "Infinite", -1)
+                snd.setLoopCount(loop if loop is not None else -1)
+                snd.setVolume(0.35)
+                self._audio_output = out
+                self._audio = snd
+                self._audio_backend = "qt"
+            except Exception:  # noqa: BLE001
+                log.warning("ViReal: QSoundEffect falló; uso el audio de Windows")
+                self._audio = None
+                self._audio_output = None
+        if self._audio_backend is None and os.name == "nt":
+            try:
+                winmm = ctypes.windll.winmm
+                winmm.PlaySoundW.argtypes = [ctypes.c_wchar_p,
+                                             ctypes.c_void_p,
+                                             ctypes.c_uint32]
+                winmm.PlaySoundW.restype = ctypes.c_bool
+                self._winmm = winmm
+                self._audio_backend = "winmm"
+            except Exception:  # noqa: BLE001
+                log.exception("ViReal: no pude inicializar el audio ambiente")
+        if self._audio_backend is None:
+            return
+        self._audio_timer = QTimer(self)
+        self._audio_timer.setInterval(1200)
+        self._audio_timer.timeout.connect(self._update_audio)
+        self._audio_timer.start()
+        log.info("ViReal: audio ambiente listo (%s)", self._audio_backend)
+
+    def _on_birds(self, on: bool) -> None:
+        self._audio_enabled = bool(on)
+        self._update_audio()
+
+    def _on_birds_volume(self, value: int) -> None:
+        if self._audio_backend != "qt":
+            return
+        volume = max(0.0, min(1.0, value / 100.0))
+        if self._audio_output is not None:
+            try:
+                self._audio_output.setVolume(volume)
+            except Exception:  # noqa: BLE001
+                pass
+        if self._audio is not None:
+            try:
+                self._audio.setVolume(volume)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _audio_wanted(self):
+        daytime = self.view._sun_dir.z() > 0.02
+        mode = "day" if daytime else "night"
+        path = self._audio_paths.get(mode)
+        if not path:
+            mode = "day" if self._audio_paths.get("day") else "night"
+            path = self._audio_paths.get(mode)
+        return mode, path
+
+    def _stop_audio(self) -> None:
+        if self._audio_backend == "qt" and self._audio is not None:
+            try:
+                self._audio.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        elif self._audio_backend == "winmm" and self._winmm_playing:
+            self._winmm.PlaySoundW(None, None, 0)
+            self._winmm_playing = False
+
+    def _update_audio(self) -> None:
+        if self._audio_backend is None:
+            return
+        mode, path = self._audio_wanted()
+        should_play = self._audio_enabled and bool(path) and self.isVisible()
+        if not should_play:
+            self._stop_audio()
+            return
+        if mode != self._audio_mode:
+            self._stop_audio()
+            if self._audio_backend == "qt" and self._audio is not None:
+                self._audio.setSource(QUrl.fromLocalFile(path))
+            self._audio_mode = mode
+        if self._audio_backend == "qt":
+            snd = self._audio
+            if snd is None:
+                return
+            try:
+                playing = snd.isPlaying()
+            except Exception:  # noqa: BLE001
+                playing = False
+            if not playing:
+                snd.play()
+            return
+        if not self._winmm_playing:
+            flags = 0x00020000 | 0x0001 | 0x0008  # filename | async | loop
+            ok = self._winmm.PlaySoundW(path, None, flags)
+            self._winmm_playing = bool(ok)
+            if not ok:
+                log.warning("ViReal: PlaySoundW no pudo abrir %s", path)
+
     def _on_babylon(self) -> None:
         if QWebEngineView is None:
             QMessageBox.warning(
@@ -3477,6 +3914,9 @@ class WorldWindow(QDialog):
             self.spin_amb.setValue(self.view.ambient)
             self.chk_grass.setChecked(self.view.grass)
             self.chk_wind.setChecked(self.view.wind)
+            self.chk_birds.setChecked(_flag("birds", False))
+            self.sld_birds.setValue(max(0, min(100, int(
+                s.value(_SETTINGS + "birds_volume", 35)))))
             self.spin_grass.setValue(self.view.grass_density)
             self.chk_ssr.setChecked(self.view.ssr)
             self.chk_ssao.setChecked(self.view.ssao)
@@ -3502,6 +3942,8 @@ class WorldWindow(QDialog):
         s.setValue(_SETTINGS + "ambient", self.view.ambient)
         s.setValue(_SETTINGS + "grass", self.view.grass)
         s.setValue(_SETTINGS + "wind", self.view.wind)
+        s.setValue(_SETTINGS + "birds", self.chk_birds.isChecked())
+        s.setValue(_SETTINGS + "birds_volume", self.sld_birds.value())
         s.setValue(_SETTINGS + "grass_density", self.view.grass_density)
         s.setValue(_SETTINGS + "ssr", self.view.ssr)
         s.setValue(_SETTINGS + "ssao", self.view.ssao)
@@ -3516,6 +3958,11 @@ class WorldWindow(QDialog):
         s.sync()
 
     def closeEvent(self, ev) -> None:
+        self._audio_enabled = False
+        self._update_audio()
+        timer = getattr(self, "_audio_timer", None)
+        if timer is not None:
+            timer.stop()
         self.save_view_state()
         self.view.mark_dirty()
         super().closeEvent(ev)

@@ -21,10 +21,14 @@ window.virealLoad = function (payload) {
   var scene = new BABYLON.Scene(engine);
   scene.useRightHandedSystem = true;
   var sky = payload.skyColor || [0.32, 0.48, 0.70];
-  var gnd = [0.32, 0.27, 0.22];
+  var gnd = payload.groundColor || [0.32, 0.27, 0.22];
+  var ambCol = new BABYLON.Color3(
+    sky[0] * 0.65 + gnd[0] * 0.35,
+    sky[1] * 0.65 + gnd[1] * 0.35,
+    sky[2] * 0.65 + gnd[2] * 0.35);
   scene.clearColor = new BABYLON.Color4(sky[0], sky[1], sky[2], 1.0);
-  scene.ambientColor = new BABYLON.Color3(sky[0], sky[1], sky[2]);
-  scene.environmentIntensity = 0.9;
+  scene.ambientColor = ambCol;
+  scene.environmentIntensity = 1.05;
   try {
     scene.environmentTexture = BABYLON.CubeTexture.CreateFromPrefilteredData(
       'https://assets.babylonjs.com/environments/environmentSpecular.env', scene);
@@ -49,11 +53,11 @@ window.virealLoad = function (payload) {
 
   var ambient = payload.ambient == null ? 0.55 : payload.ambient;
   var hemi = new BABYLON.HemisphericLight('hemi', new BABYLON.Vector3(0, 1, 0), scene);
-  hemi.intensity = Math.max(0.95, ambient * 1.6);
+  hemi.intensity = Math.max(1.25, ambient * 2.0);
   hemi.diffuse = new BABYLON.Color3(sky[0], sky[1], sky[2]);
   hemi.groundColor = new BABYLON.Color3(gnd[0], gnd[1], gnd[2]);
   var bounce = new BABYLON.HemisphericLight('bounce', new BABYLON.Vector3(0, -1, 0), scene);
-  bounce.intensity = 0.45;
+  bounce.intensity = 0.70;
   bounce.diffuse = new BABYLON.Color3(gnd[0], gnd[1], gnd[2]);
   bounce.groundColor = new BABYLON.Color3(sky[0], sky[1], sky[2]);
 
@@ -116,8 +120,8 @@ window.virealLoad = function (payload) {
     mat.alpha = run.alpha == null ? 1 : run.alpha;
     mat.backFaceCulling = false;
     mat.useAmbientColor = true;
-    mat.ambientColor = new BABYLON.Color3(sky[0], sky[1], sky[2]);
-    mat.environmentIntensity = 0.9;
+    mat.ambientColor = ambCol;
+    mat.environmentIntensity = 1.05;
     if (run.texture) {
       var tex = new BABYLON.Texture(run.texture, scene, false, false);
       tex.hasAlpha = mat.alpha < 1;

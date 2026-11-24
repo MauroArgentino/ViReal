@@ -31,8 +31,15 @@ pie** con la cámara libre, mientras sigues modelando.
   receptor.
 - **Ambiente e IBL del cielo**: el relleno de sombra y los reflejos de entorno
   se integran muestreando el propio cielo físico, así que cambian con la hora y
-  con la orientación de cada cara. El brillo especular se ensancha según el
-  tamaño angular del sol, para reflejos suaves en vez de un punto duro.
+  con la orientación de cada cara. Las paredes verticales reciben un relleno
+  hemisférico diurno reforzado y rebote del lado iluminado, para que el lado en
+  sombra no quede antinaturalmente negro. El brillo especular se ensancha según
+  el tamaño angular del sol, para reflejos suaves en vez de un punto duro. El
+  reflejo de entorno usa la **sombra dura** del mapa y, además, recorre el rayo
+  reflejado contra el G-buffer: si un muro o techo aparece en ese camino, el
+  disco solar, su aureola Mie y el cielo quedan ocultos, aunque la luz directa
+  conserve sombras suaves. Así un sol al este no se refleja en un piso protegido
+  por planos a su alrededor.
 - **Motor HDR con *post-proceso***: la escena se dibuja en *float* (RGBA16F) y
   se procesa en pasos separados — **SSAO** (oclusión ambiental, suavizado antes
   de aplicarse), ***bloom*** (halo del sol y luces) y **composición** con
@@ -69,9 +76,11 @@ pie** con la cámara libre, mientras sigues modelando.
 - **Cámara libre tipo juego** (ratón + WASD) y **reencuadre automático** al
   abrir la ventana.
 - **Auto-actualización**: si cambias el modelo, la ventana lo reconstruye sola.
+- **Audio ambiente día/noche**: pájaros con reverberación exterior durante el
+  día y grillos de noche al oscurecer, con volumen opcional y persistente.
 - **Ajustes persistentes**: sombras, exposición, ambiente, césped, viento,
-  densidad de césped, reflejos, oclusión, *bloom*, relieve, brillo de pisos y
-  paleta de cielo se recuerdan entre sesiones.
+  densidad de césped, reflejos, oclusión, *bloom*, relieve, brillo de pisos,
+  paleta de cielo y audio se recuerdan entre sesiones.
 
 ---
 
@@ -121,11 +130,16 @@ Puedes abrir la ventana de dos formas:
 | `W` / `A` / `S` / `D` | Moverse adelante / izquierda / atrás / derecha |
 | `Q` / `E`          | Bajar / subir                            |
 | `Shift`            | Correr                                   |
-| `Espacio`          | Activar / desactivar gravedad y colisiones (modo caminar) |
+| `Espacio`          | Activar / desactivar gravedad y colisiones (modo caminar; sube escalones de hasta 30 cm) |
 | Rueda del ratón    | Acercar / alejar                         |
+| Rueda **presionada** + arrastrar | Recorrer la hora del día       |
+| `Shift` + botón derecho + arrastrar | Recorrer la hora (como en Enscape) |
+| `U` / `I`          | Adelantar / retrasar la hora             |
+| `Home`             | Restaurar el sol del documento           |
+| `C` (mantener)     | Agacharse con transición suave           |
 | `R`                | Reencuadrar todo el modelo               |
 | `T`                | Activar / desactivar sombras             |
-| `C`                | Activar / desactivar el césped 3D        |
+| `H`                | Activar / desactivar el césped 3D        |
 | `V`                | Activar / desactivar el viento           |
 | `F`                | Activar / desactivar reflejos (SSR)      |
 | `G`                | Activar / desactivar oclusión (SSAO)     |
@@ -199,6 +213,8 @@ ingetrazo_vireal/
 ├── babylon/         # visor Babylon.js (beta)
 │   ├── index.html
 │   └── viewer.js
+├── audio/           # sonido ambiente CC0
+│   └── birds_cc0.wav
 ├── grasslands_sunset_2k.hdr
 ├── README.md
 ├── LICENSE          # GPL-3.0-or-later
@@ -215,9 +231,10 @@ ingetrazo_vireal/
 ./build_zip.ps1 -Version 0.5.0
 ```
 
-Genera `dist/ingetrazo_vireal-0.7.1.zip` con `vireal.py`, `README.md`,
-`LICENSE`, `CHANGELOG.md`, el HDR y la carpeta `babylon/`. El usuario final
-necesita copiar `vireal.py`, el HDR y `babylon/` a su carpeta de plugins.
+Genera `dist/ingetrazo_vireal-0.8.0.zip` con `vireal.py`, `README.md`,
+`LICENSE`, `CHANGELOG.md`, el HDR y las carpetas `babylon/` y `audio/`. El
+usuario final necesita copiar `vireal.py`, el HDR, `babylon/` y `audio/` a su
+carpeta de plugins.
 Recuerda subir también `dist/` a la *release* de GitHub (o adjuntar el `.zip`).
 
 > Si omites `-Version`, el script la lee automáticamente de `__version__` en
@@ -238,6 +255,39 @@ Requiere que IngeTrazo incluya `PySide6.QtWebEngineWidgets`. El motor Babylon
 y el mapa de entorno IBL se descargan desde sus URLs oficiales, así que esta
 ventana necesita conexión a internet. Si no está disponible, ilumina igual con
 luz hemisférica y el render OpenGL sigue funcionando igual.
+
+---
+
+## Sonido ambiente
+
+La casilla **Ambiente** reproduce un loop estéreo **sin sonido directo**: sólo
+la reverberación exterior, con doble filtrado de agudos (suena lejano, no
+pegado a la cámara): `audio/birds_ambient.wav` de día y
+`audio/crickets_ambient.wav` de noche (el cambio sigue a la hora del sol, así
+que también responde al recorrido con rueda/`U`/`I`). El deslizador adyacente
+ajusta el volumen, se apaga al cerrar la ventana y recuerda ambos valores entre
+sesiones. Si la instalación no trae `PySide6.QtMultimedia` o `QSoundEffect`
+falla, se usa el reproductor de Windows (`winmm`): el sonido sigue funcionando,
+pero el volumen se controla con el mezclador del sistema.
+
+---
+
+## Recorrido del día
+
+Con la **rueda presionada** y arrastrando a izquierda/derecha se recorre la
+hora del día: alba, mediodía, ocaso, noche y vuelta al alba. También funcionan
+**Shift + botón derecho + arrastrar** y las teclas **U/I**; **Home** vuelve al
+sol que viene del documento. De noche aparecen la **luna** (con halo y luz
+difusa) y un campo de **estrellas** procedural.
+
+La documentación oficial de Enscape confirma el ajuste de hora con
+**Shift + botón derecho** o **U/I**
+(https://documentation.chaos.com/space/ENSCAPE/842203139/Control+and+Input);
+allí la rueda se usa para avanzar la cámara, así que aquí se añadió además la
+rueda presionada según tu pedido.
+
+La ventana de vista real y la de Babylon se pueden **minimizar y maximizar**
+con los botones del título.
 
 ---
 
@@ -275,6 +325,16 @@ El HDR `grasslands_sunset_2k.hdr` **no es GPL**: es
 bajo **CC0 1.0** (foto: Dimitrios Savva; procesado: Jarod Guest). Verificado
 por MD5 `e90aa885c6237866893a696e650f9cba` contra la API de Poly Haven. CC0
 no exige atribución, pero se incluye de cortesía.
+
+Los loops incluidos son versiones procesadas (reverberación, estéreo y
+*crossfade*) de grabaciones **CC0 1.0**:
+
+- `audio/birds_ambient.wav` ← `Black-capped Chickadee 201947598.wav` de
+  [*ngoomie*](https://commons.wikimedia.org/wiki/File:Black-capped_Chickadee_201947598.wav)
+  (grabado en Calgary, 2024; SHA-1 `90830954646a38e35606da2063281be6de309124`).
+- `audio/crickets_ambient.wav` ← `cricketsounds090613.wav` de
+  [*syncopika*](https://opengameart.org/content/cricket-sounds) (grabado en su
+  patio, 2014; SHA-256 `ECC088A3D1AB967202B63A92836DADC47BD08C8AB3F17D8527F620264AA5FAF9`).
 
 ## Autor
 

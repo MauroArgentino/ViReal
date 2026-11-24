@@ -8,6 +8,10 @@ __pycache__/
 # Build
 dist/
 
+# Audio fuente (sólo se versionan los loops procesados)
+audio/birds_cc0.wav
+audio/crickets_cc0_source.wav
+
 # Editores / IDE
 .vscode/
 .idea/

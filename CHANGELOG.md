@@ -2,6 +2,45 @@
 
 Todas las fechas son en formato AAAA-MM-DD.
 
+## [0.8.0] — 2026-11-23
+
+### Añadido
+- **Audio ambiente día/noche** opcional: casilla **Ambiente** y volumen en la
+  barra. Pájaros y grillos procesados sin sonido directo: sólo reverberación
+  exterior con doble filtrado de agudos, para que suenen lejanos. El cambio
+  sigue a la hora del sol, incluso al arrastrar la hora.
+  Usa `QSoundEffect` (si QtMultimedia está disponible) y guarda el estado en
+  `QSettings`.
+- Loops CC0 `audio/birds_ambient.wav` y `audio/crickets_ambient.wav` incluidos
+  en el paquete (ver README).
+- **Step-up**: el caminador sube escalones y bordillos de hasta 30 cm. Ahora se
+  ignoran las caras verticales bajas que antes bloqueaban el avance.
+- **Relleno de paredes**: las caras verticales sin sol directo reciben más luz
+  hemisférica diurna y rebote del lado iluminado; dejan de verse negras. El
+  azul del cielo se desatura parcialmente para evitar un aspecto surrealista.
+  Igual ajuste en el visor Babylon.js beta.
+- **Audio sin QtMultimedia**: si `QSoundEffect` no está disponible o falla, se
+  usa `winmm.PlaySoundW` de Windows, así la casilla **Ambiente** sigue activa.
+- **Agacharse**: mantener **C** baja la cámara con transición suave y soltarla
+  la levanta (impidiendo levantarse bajo techo). La tecla **H** reemplaza a C
+  para activar/desactivar el césped.
+- **Hora arrastrable**: rueda del ratón (o **Shift + botón derecho**, como en
+  Enscape) y **U/I** recorren el día; **Home** restaura el sol del documento.
+  Aparecen luna, halo y estrellas de noche, con luz lunar difusa.
+- La ventana de vista real (y la de Babylon) ahora se pueden **minimizar y
+  maximizar**.
+
+### Corregido
+- Los reflejos de entorno usan ahora la **sombra dura** del mapa, no la versión
+  suavizada de la luz directa, y marchan el rayo reflejado contra el G-buffer:
+  ni el disco solar, ni su aureola Mie, ni el cielo difuso atraviesan paredes o
+  techos en el reflejo del piso. La iluminación directa mantiene sombras suaves.
+
+### Referencia
+- Controles de sol de Enscape:
+  https://documentation.chaos.com/space/ENSCAPE/842203139/Control+and+Input
+  (Shift + botón derecho o U/I; la rueda se usa para mover la cámara).
+
 ## [0.7.1] — 2026-11-19
 
 ### Cambiado
