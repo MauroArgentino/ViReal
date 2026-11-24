@@ -2062,21 +2062,9 @@ class WorldView(QOpenGLWidget):
         la geometría del modelo."""
         self._grass_dirty = True
 
-    def _c_key_down(self):
-        if os.name != "nt":
-            return None
-        try:
-            return bool(ctypes.windll.user32.GetAsyncKeyState(0x43) & 0x8000)
-        except Exception:  # noqa: BLE001
-            return None
-
     def _tick(self) -> None:
         if not self.isVisible():
             return
-        if self.walk and (self.isActiveWindow() or self.hasFocus()):
-            down = self._c_key_down()
-            if down is not None:
-                self._crouch = down
         self._time = self._clock.elapsed() / 1000.0
         moved = bool(self._keys) or self._looking or self.walk
         if moved:
@@ -3213,7 +3201,7 @@ class WorldView(QOpenGLWidget):
                 "Shift: correr · R: reencuadrar · Espacio: gravedad " +
                 ("ACTIVA (colisiones)" if self.walk else "inactiva (vuelo)") +
                 (" · C: agachado" if self._crouch else ""),
-                "C: agacharse · H: césped · T: sombras · V: viento · "
+                "C: alternar agachado · H: césped · T: sombras · V: viento · "
                 "F: reflejos · G: oclusión · B: bloom · N: cielo",
                 "Rueda/Shift+der: hora · U/I: hora · Home: restaurar" +
                 ((" · %02d:%02d" % (int(self._hour_override),
@@ -3276,7 +3264,7 @@ class WorldView(QOpenGLWidget):
         if k == Qt.Key_C:
             if ev.isAutoRepeat():
                 return
-            self._crouch = True
+            self._crouch = not self._crouch
             self.update()
             return
         if k == Qt.Key_V:
@@ -3308,9 +3296,6 @@ class WorldView(QOpenGLWidget):
         super().keyPressEvent(ev)
 
     def keyReleaseEvent(self, ev) -> None:
-        if ev.key() == Qt.Key_C and not ev.isAutoRepeat():
-            self._crouch = False
-            self.update()
         self._keys.discard(ev.key())
         self._mods = ev.modifiers()
         super().keyReleaseEvent(ev)
@@ -3337,7 +3322,6 @@ class WorldView(QOpenGLWidget):
         self._keys.clear()
         self._looking = False
         self._scrubbing_time = False
-        self._crouch = False
         self._mods = Qt.NoModifier
         self.unsetCursor()
 

@@ -136,7 +136,7 @@ Puedes abrir la ventana de dos formas:
 | `Shift` + botón derecho + arrastrar | Recorrer la hora (como en Enscape) |
 | `U` / `I`          | Adelantar / retrasar la hora             |
 | `Home`             | Restaurar el sol del documento           |
-| `C` (mantener)     | Agacharse con transición suave           |
+| `C`                | Alternar agachado / ponerse de pie       |
 | `R`                | Reencuadrar todo el modelo               |
 | `T`                | Activar / desactivar sombras             |
 | `H`                | Activar / desactivar el césped 3D        |

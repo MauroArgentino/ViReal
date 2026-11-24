@@ -21,9 +21,9 @@ Todas las fechas son en formato AAAA-MM-DD.
   Igual ajuste en el visor Babylon.js beta.
 - **Audio sin QtMultimedia**: si `QSoundEffect` no está disponible o falla, se
   usa `winmm.PlaySoundW` de Windows, así la casilla **Ambiente** sigue activa.
-- **Agacharse**: mantener **C** baja la cámara con transición suave y soltarla
-  la levanta (impidiendo levantarse bajo techo). La tecla **H** reemplaza a C
-  para activar/desactivar el césped.
+- **Agacharse**: **C** alterna entre bajar y levantar la cámara con transición
+  suave (impidiendo levantarse bajo techo). La tecla **H** reemplaza a C para
+  activar/desactivar el césped.
 - **Hora arrastrable**: rueda del ratón (o **Shift + botón derecho**, como en
   Enscape) y **U/I** recorren el día; **Home** restaura el sol del documento.
   Aparecen luna, halo y estrellas de noche, con luz lunar difusa.
@@ -33,9 +33,8 @@ Todas las fechas son en formato AAAA-MM-DD.
 ### Corregido
 - La barra de volumen ya no queda fija con el backend `winmm`: ajusta el
   volumen de salida de Windows y lo restaura al cerrar la ventana.
-- Mantener **C** ya no vuelve a poner de pie al caminador: se ignoran los
-  *key releases* por auto-repetición y se confirma el estado real de la tecla
-  con `GetAsyncKeyState` mientras la vista tiene el foco.
+- **C** ya no depende de mantener la tecla ni de sondear `GetAsyncKeyState`:
+  cada pulsación alterna agacharse/levantarse, sin importar la auto-repetición.
 - Los reflejos de entorno usan ahora la **sombra dura** del mapa, no la versión
   suavizada de la luz directa, y marchan el rayo reflejado contra el G-buffer:
   ni el disco solar, ni su aureola Mie, ni el cielo difuso atraviesan paredes o
