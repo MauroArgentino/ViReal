@@ -267,8 +267,8 @@ pegado a la cámara): `audio/birds_ambient.wav` de día y
 que también responde al recorrido con rueda/`U`/`I`). El deslizador adyacente
 ajusta el volumen, se apaga al cerrar la ventana y recuerda ambos valores entre
 sesiones. Si la instalación no trae `PySide6.QtMultimedia` o `QSoundEffect`
-falla, se usa el reproductor de Windows (`winmm`): el sonido sigue funcionando,
-pero el volumen se controla con el mezclador del sistema.
+falla, se usa el reproductor de Windows (`winmm`): el sonido sigue funcionando
+y la barra ajusta el volumen de la salida de Windows (se restaura al cerrar).
 
 ---
 

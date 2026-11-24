@@ -31,6 +31,8 @@ Todas las fechas son en formato AAAA-MM-DD.
   maximizar**.
 
 ### Corregido
+- La barra de volumen ya no queda fija con el backend `winmm`: ajusta el
+  volumen de salida de Windows y lo restaura al cerrar la ventana.
 - Mantener **C** ya no vuelve a poner de pie al caminador: se ignoran los
   *key releases* por auto-repetición y se confirma el estado real de la tecla
   con `GetAsyncKeyState` mientras la vista tiene el foco.

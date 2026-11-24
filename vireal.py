@@ -3473,6 +3473,8 @@ class WorldWindow(QDialog):
         self._audio_timer = None
         self._winmm = None
         self._winmm_playing = False
+        self._winmm_volume_ok = False
+        self._winmm_volume_orig = None
         self._audio_enabled = False
         self._init_audio()
 
@@ -3546,10 +3548,14 @@ class WorldWindow(QDialog):
         self.sld_birds.setRange(0, 100)
         self.sld_birds.setValue(35)
         self.sld_birds.setFixedWidth(70)
-        self.sld_birds.setEnabled(self._audio_backend == "qt")
-        self.sld_birds.setToolTip(
-            "Volumen del audio ambiente" if self._audio_backend == "qt"
-            else "Volumen no disponible con el audio de Windows")
+        self.sld_birds.setEnabled(self._audio_backend is not None)
+        if self._audio_backend == "qt":
+            volume_tip = "Volumen del audio ambiente"
+        elif self._audio_backend == "winmm" and self._winmm_volume_ok:
+            volume_tip = "Volumen de la salida de Windows"
+        else:
+            volume_tip = "Volumen no disponible"
+        self.sld_birds.setToolTip(volume_tip)
         self.sld_birds.valueChanged.connect(self._on_birds_volume)
         lay.addWidget(self.sld_birds)
 
@@ -3730,6 +3736,19 @@ class WorldWindow(QDialog):
                 winmm.PlaySoundW.restype = ctypes.c_bool
                 self._winmm = winmm
                 self._audio_backend = "winmm"
+                try:
+                    winmm.waveOutGetVolume.argtypes = [
+                        ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+                    winmm.waveOutGetVolume.restype = ctypes.c_uint32
+                    winmm.waveOutSetVolume.argtypes = [
+                        ctypes.c_void_p, ctypes.c_uint32]
+                    winmm.waveOutSetVolume.restype = ctypes.c_uint32
+                    orig = ctypes.c_uint32()
+                    if winmm.waveOutGetVolume(None, ctypes.byref(orig)) == 0:
+                        self._winmm_volume_orig = orig.value
+                    self._winmm_volume_ok = True
+                except Exception:  # noqa: BLE001
+                    log.warning("ViReal: volumen winmm no disponible")
             except Exception:  # noqa: BLE001
                 log.exception("ViReal: no pude inicializar el audio ambiente")
         if self._audio_backend is None:
@@ -3744,10 +3763,22 @@ class WorldWindow(QDialog):
         self._audio_enabled = bool(on)
         self._update_audio()
 
+    def _set_winmm_volume(self, value: float) -> None:
+        if not (self._winmm_volume_ok and self._winmm is not None):
+            return
+        level = int(max(0.0, min(1.0, value)) * 0xFFFF)
+        try:
+            self._winmm.waveOutSetVolume(None, (level << 16) | level)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _on_birds_volume(self, value: int) -> None:
+        volume = max(0.0, min(1.0, value / 100.0))
+        if self._audio_backend == "winmm":
+            self._set_winmm_volume(volume)
+            return
         if self._audio_backend != "qt":
             return
-        volume = max(0.0, min(1.0, value / 100.0))
         if self._audio_output is not None:
             try:
                 self._audio_output.setVolume(volume)
@@ -3972,6 +4003,12 @@ class WorldWindow(QDialog):
     def closeEvent(self, ev) -> None:
         self._audio_enabled = False
         self._update_audio()
+        if (self._audio_backend == "winmm" and self._winmm_volume_ok
+                and self._winmm_volume_orig is not None):
+            try:
+                self._winmm.waveOutSetVolume(None, self._winmm_volume_orig)
+            except Exception:  # noqa: BLE001
+                pass
         timer = getattr(self, "_audio_timer", None)
         if timer is not None:
             timer.stop()
