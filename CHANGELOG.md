@@ -31,6 +31,9 @@ Todas las fechas son en formato AAAA-MM-DD.
   maximizar**.
 
 ### Corregido
+- Mantener **C** ya no vuelve a poner de pie al caminador: se ignoran los
+  *key releases* por auto-repetición y se confirma el estado real de la tecla
+  con `GetAsyncKeyState` mientras la vista tiene el foco.
 - Los reflejos de entorno usan ahora la **sombra dura** del mapa, no la versión
   suavizada de la luz directa, y marchan el rayo reflejado contra el G-buffer:
   ni el disco solar, ni su aureola Mie, ni el cielo difuso atraviesan paredes o

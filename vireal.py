@@ -2062,9 +2062,21 @@ class WorldView(QOpenGLWidget):
         la geometría del modelo."""
         self._grass_dirty = True
 
+    def _c_key_down(self):
+        if os.name != "nt":
+            return None
+        try:
+            return bool(ctypes.windll.user32.GetAsyncKeyState(0x43) & 0x8000)
+        except Exception:  # noqa: BLE001
+            return None
+
     def _tick(self) -> None:
         if not self.isVisible():
             return
+        if self.walk and (self.isActiveWindow() or self.hasFocus()):
+            down = self._c_key_down()
+            if down is not None:
+                self._crouch = down
         self._time = self._clock.elapsed() / 1000.0
         moved = bool(self._keys) or self._looking or self.walk
         if moved:
@@ -3296,7 +3308,7 @@ class WorldView(QOpenGLWidget):
         super().keyPressEvent(ev)
 
     def keyReleaseEvent(self, ev) -> None:
-        if ev.key() == Qt.Key_C:
+        if ev.key() == Qt.Key_C and not ev.isAutoRepeat():
             self._crouch = False
             self.update()
         self._keys.discard(ev.key())
